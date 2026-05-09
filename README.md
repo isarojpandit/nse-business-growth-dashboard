@@ -1,3 +1,9 @@
+## Live Dashboard
+
+The dashboard is deployed here:
+
+https://nse-business-growth-dashboard.streamlit.app/
+
 # NSE Business Growth & Volume Dashboard
 
 This project automates an NSE Business Growth & Volume dashboard using Python, SQLite, and Streamlit.
