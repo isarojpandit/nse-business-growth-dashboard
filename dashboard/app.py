@@ -10,6 +10,7 @@ import plotly.express as px
 
 
 DB_PATH = Path("data/nse_business_growth.db")
+RAW_EXCEL_PATH = Path("data/raw/Business growth & Volume Dashboard.xlsx")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
@@ -42,10 +43,12 @@ def load_data():
     df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
     df["turnover"] = pd.to_numeric(df["turnover"], errors="coerce")
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+
     df["mom_turnover_change"] = pd.to_numeric(
         df["mom_turnover_change"],
         errors="coerce"
     )
+
     df["mom_volume_change"] = pd.to_numeric(
         df["mom_volume_change"],
         errors="coerce"
@@ -71,6 +74,20 @@ def load_data():
     df["financial_month_order"] = df["month_name"].map(month_order)
 
     return df
+
+
+def save_uploaded_excel(uploaded_file):
+    """
+    Save uploaded Excel file into data/raw folder with the standard file name.
+    This allows the existing pipeline to run without any code change.
+    """
+
+    RAW_EXCEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(RAW_EXCEL_PATH, "wb") as file:
+        file.write(uploaded_file.getbuffer())
+
+    return RAW_EXCEL_PATH
 
 
 def get_last_updated_time():
@@ -530,9 +547,32 @@ def main():
     st.title("📈 NSE Business Growth & Volume Dashboard")
     st.caption("Automated dashboard using Excel → SQLite → Streamlit")
 
-    st.sidebar.header("Filters")
+    st.sidebar.header("Data Upload & Refresh")
 
-    if st.sidebar.button("🔄 Run Pipeline from Excel"):
+    uploaded_file = st.sidebar.file_uploader(
+        "Upload Excel File",
+        type=["xlsx"]
+    )
+
+    if uploaded_file is not None:
+        if st.sidebar.button("⬆️ Upload & Run Pipeline"):
+            saved_path = save_uploaded_excel(uploaded_file)
+
+            st.sidebar.success(
+                f"Excel file uploaded successfully: {saved_path}"
+            )
+
+            with st.spinner("Running pipeline from uploaded Excel file..."):
+                success, message = run_pipeline()
+
+            if success:
+                st.sidebar.success(message)
+                st.cache_data.clear()
+                st.rerun()
+            else:
+                st.sidebar.error(message)
+
+    if st.sidebar.button("🔄 Run Pipeline from Existing Excel"):
         with st.spinner("Reading Excel, cleaning data, and updating database..."):
             success, message = run_pipeline()
 
@@ -547,9 +587,15 @@ def main():
         st.cache_data.clear()
         st.rerun()
 
+    st.sidebar.divider()
+    st.sidebar.header("Filters")
+
     if not DB_PATH.exists():
-        st.error("Database not found. Please run pipeline first.")
-        st.info("You can click 'Run Pipeline from Excel' from the sidebar.")
+        st.warning("Database not found.")
+        st.info(
+            "Please upload the Excel file from the sidebar and click "
+            "'Upload & Run Pipeline'."
+        )
         return
 
     df = load_data()
