@@ -1,0 +1,1 @@
+NSE_BUSINESS_GROWTH_URL = "https://www.nseindia.com/market-data/business-growth-in-cm-market"
