@@ -1,1023 +1,1108 @@
 import sys
 import sqlite3
 from pathlib import Path
-from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
-import plotly.express as px
 
-
-DB_PATH = Path("data/nse_business_growth.db")
-RAW_EXCEL_PATH = Path("data/raw/Business growth & Volume Dashboard.xlsx")
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
-from scripts.run_pipeline import run_pipeline
+from dashboard.components.charts import (
+    TIME_RANGE_OPTIONS,
+    apply_time_range_filter,
+    create_monthly_turnover_chart,
+    create_monthly_volume_chart,
+    create_mom_turnover_chart,
+    create_mom_volume_chart,
+    create_quarterly_turnover_chart,
+    create_quarterly_volume_chart,
+    create_qoq_turnover_chart,
+    create_qoq_volume_chart,
+    create_comparative_chart,
+)
+
+
+DB_PATH = PROJECT_ROOT / "data" / "nse_business_growth.db"
+CSV_PATH = PROJECT_ROOT / "data" / "processed" / "clean_nse_business_growth_from_nse.csv"
+TABLE_NAME = "nse_business_growth"
 
 
 st.set_page_config(
     page_title="NSE Business Growth Dashboard",
     page_icon="📈",
-    layout="wide"
+    layout="wide",
 )
 
 
-@st.cache_data
-def load_data():
-    conn = sqlite3.connect(DB_PATH)
-
-    df = pd.read_sql_query(
+def inject_custom_css():
+    st.markdown(
         """
-        SELECT *
-        FROM nse_business_growth
+        <style>
+            .main {
+                background-color: #f8fafc;
+            }
+
+            .block-container {
+                padding-top: 3rem;
+                padding-bottom: 2rem;
+            }
+
+            .dashboard-title {
+                font-size: 2.45rem;
+                font-weight: 900;
+                line-height: 1.28;
+                letter-spacing: 0.6px;
+                margin-top: 0.6rem;
+                margin-bottom: 0.4rem;
+                padding-top: 0.2rem;
+                padding-bottom: 0.25rem;
+                overflow: visible;
+
+                background: linear-gradient(
+                    90deg,
+                    #0f172a,
+                    #2563eb,
+                    #16a34a,
+                    #0f172a
+                );
+                background-size: 300% 300%;
+                -webkit-background-clip: text;
+                -webkit-text-fill-color: transparent;
+                animation: titleGradient 5s ease infinite;
+            }
+
+            @keyframes titleGradient {
+                0% {
+                    background-position: 0% 50%;
+                }
+                50% {
+                    background-position: 100% 50%;
+                }
+                100% {
+                    background-position: 0% 50%;
+                }
+            }
+
+            .dashboard-subtitle {
+                font-size: 1rem;
+                color: #475569;
+                margin-top: 0.2rem;
+                margin-bottom: 1.5rem;
+            }
+
+            .metric-card {
+                background: white;
+                border-radius: 14px;
+                padding: 18px 20px;
+                box-shadow: 0 2px 10px rgba(15, 23, 42, 0.08);
+                border: 1px solid #e2e8f0;
+                min-height: 112px;
+            }
+
+            .metric-label {
+                font-size: 0.82rem;
+                color: #64748b;
+                font-weight: 700;
+                margin-bottom: 8px;
+            }
+
+            .metric-value {
+                font-size: 1.55rem;
+                color: #0f172a;
+                font-weight: 900;
+                line-height: 1.2;
+            }
+
+            .delta-pill-positive {
+                display: inline-block;
+                margin-top: 10px;
+                padding: 4px 10px;
+                border-radius: 999px;
+                background: #dcfce7;
+                color: #166534;
+                font-weight: 700;
+                font-size: 0.82rem;
+            }
+
+            .delta-pill-negative {
+                display: inline-block;
+                margin-top: 10px;
+                padding: 4px 10px;
+                border-radius: 999px;
+                background: #fee2e2;
+                color: #991b1b;
+                font-weight: 700;
+                font-size: 0.82rem;
+            }
+
+            .delta-pill-neutral {
+                display: inline-block;
+                margin-top: 10px;
+                padding: 4px 10px;
+                border-radius: 999px;
+                background: #e5e7eb;
+                color: #374151;
+                font-weight: 700;
+                font-size: 0.82rem;
+            }
+
+            .note-box {
+                background: #fff7ed;
+                border: 1px solid #fed7aa;
+                color: #9a3412;
+                padding: 12px 14px;
+                border-radius: 10px;
+                font-size: 0.92rem;
+                margin-bottom: 1rem;
+            }
+
+            .insight-box {
+                background: #eff6ff;
+                border: 1px solid #bfdbfe;
+                color: #1e40af;
+                padding: 13px 15px;
+                border-radius: 10px;
+                font-size: 0.95rem;
+                margin-top: 1rem;
+                margin-bottom: 1rem;
+            }
+        </style>
         """,
-        conn
+        unsafe_allow_html=True,
     )
 
-    conn.close()
 
-    df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
-    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype("Int64")
-    df["turnover"] = pd.to_numeric(df["turnover"], errors="coerce")
-    df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+@st.cache_data(show_spinner=False)
+def load_data_from_db():
+    if not DB_PATH.exists():
+        return pd.DataFrame()
 
-    df["mom_turnover_change"] = pd.to_numeric(
-        df["mom_turnover_change"],
-        errors="coerce"
+    try:
+        conn = sqlite3.connect(DB_PATH)
+
+        query = f"""
+        SELECT
+            segment,
+            instrument,
+            year,
+            month_label,
+            month_date,
+            calendar_quarter,
+            financial_year,
+            financial_quarter,
+            turnover,
+            volume,
+            mom_turnover_change,
+            mom_volume_change
+        FROM {TABLE_NAME}
+        """
+
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+
+        return df
+
+    except Exception as error:
+        st.warning(f"Could not load SQLite database: {error}")
+        return pd.DataFrame()
+
+
+@st.cache_data(show_spinner=False)
+def load_data_from_csv():
+    if not CSV_PATH.exists():
+        return pd.DataFrame()
+
+    return pd.read_csv(
+        CSV_PATH,
+        keep_default_na=False,
     )
 
-    df["mom_volume_change"] = pd.to_numeric(
-        df["mom_volume_change"],
-        errors="coerce"
+
+def clean_loaded_data(df):
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    df["segment"] = df["segment"].astype(str).str.strip()
+
+    df["instrument"] = (
+        df["instrument"]
+        .replace("", "NA")
+        .fillna("NA")
+        .astype(str)
+        .str.strip()
     )
 
-    df["month_name"] = df["month_date"].dt.strftime("%b")
+    df["month_label"] = df["month_label"].astype(str).str.strip()
 
-    month_order = {
-        "Apr": 1,
-        "May": 2,
-        "Jun": 3,
-        "Jul": 4,
-        "Aug": 5,
-        "Sep": 6,
-        "Oct": 7,
-        "Nov": 8,
-        "Dec": 9,
-        "Jan": 10,
-        "Feb": 11,
-        "Mar": 12
-    }
+    df["month_date"] = pd.to_datetime(
+        df["month_date"],
+        errors="coerce",
+    )
 
-    df["financial_month_order"] = df["month_name"].map(month_order)
+    df = df.dropna(subset=["month_date"])
+
+    numeric_columns = [
+        "turnover",
+        "volume",
+        "mom_turnover_change",
+        "mom_volume_change",
+    ]
+
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
+
+    df["year"] = pd.to_numeric(
+        df["year"],
+        errors="coerce",
+    ).astype("Int64")
+
+    df = df.sort_values(
+        ["segment", "instrument", "month_date"]
+    )
 
     return df
 
 
-def save_uploaded_excel(uploaded_file):
-    """
-    Save uploaded Excel file into data/raw folder with the standard file name.
-    This allows the existing pipeline to run without any code change.
-    """
+def load_dashboard_data():
+    df = load_data_from_db()
 
-    RAW_EXCEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if df.empty:
+        df = load_data_from_csv()
 
-    with open(RAW_EXCEL_PATH, "wb") as file:
-        file.write(uploaded_file.getbuffer())
-
-    return RAW_EXCEL_PATH
+    return clean_loaded_data(df)
 
 
-def get_last_updated_time():
-    if not DB_PATH.exists():
-        return "Database not created yet"
-
-    modified_timestamp = DB_PATH.stat().st_mtime
-    modified_time = datetime.fromtimestamp(modified_timestamp)
-
-    return modified_time.strftime("%d-%b-%Y %I:%M %p")
-
-
-def format_number(value):
+def format_indian_number(value, decimals=2):
     if pd.isna(value):
-        return "N/A"
+        return "-"
 
-    if abs(value) >= 1_00_00_000:
-        return f"{value / 1_00_00_000:.2f} Cr"
+    value = float(value)
+    abs_value = abs(value)
 
-    if abs(value) >= 1_00_000:
-        return f"{value / 1_00_000:.2f} L"
+    if abs_value >= 1_00_00_000:
+        return f"{value / 1_00_00_000:,.{decimals}f}Cr"
 
-    return f"{value:,.2f}"
+    if abs_value >= 1_00_000:
+        return f"{value / 1_00_000:,.{decimals}f}L"
+
+    if abs_value >= 1_000:
+        return f"{value / 1_000:,.{decimals}f}K"
+
+    return f"{value:,.{decimals}f}"
+
+
+def format_turnover_cr(value):
+    if pd.isna(value):
+        return "-"
+
+    value = float(value)
+    abs_value = abs(value)
+
+    if abs_value >= 1_00_000:
+        return f"₹ {value / 1_00_000:,.2f}L Cr"
+
+    if abs_value >= 1_000:
+        return f"₹ {value / 1_000:,.2f}K Cr"
+
+    return f"₹ {value:,.2f} Cr"
 
 
 def format_percent(value):
     if pd.isna(value):
-        return "N/A"
+        return "-"
 
-    return f"{value * 100:.2f}%"
-
-
-def format_dataframe_for_display(df):
-    display_df = df.copy()
-
-    number_columns = [
-        "turnover",
-        "volume",
-        "turnover_3m_ma",
-        "volume_3m_ma",
-        "average_turnover",
-        "average_volume",
-        "total_turnover",
-        "total_volume"
-    ]
-
-    percent_columns = [
-        "mom_turnover_change",
-        "mom_volume_change",
-        "qoq_turnover_change",
-        "qoq_volume_change"
-    ]
-
-    for col in number_columns:
-        if col in display_df.columns:
-            display_df[col] = display_df[col].apply(format_number)
-
-    for col in percent_columns:
-        if col in display_df.columns:
-            display_df[col] = display_df[col].apply(format_percent)
-
-    return display_df
+    return f"{value * 100:,.2f}%"
 
 
-def create_quarterly_data(df):
-    quarterly_df = (
-        df.groupby(
-            ["segment", "instrument", "financial_year", "financial_quarter"],
-            as_index=False
-        )
-        .agg(
-            average_turnover=("turnover", "mean"),
-            average_volume=("volume", "mean"),
-            quarter_start=("month_date", "min")
-        )
-    )
+def get_delta_class(value):
+    if pd.isna(value):
+        return "delta-pill-neutral"
 
-    quarter_order = {
-        "Q1": 1,
-        "Q2": 2,
-        "Q3": 3,
-        "Q4": 4
-    }
+    if value > 0:
+        return "delta-pill-positive"
 
-    quarterly_df["quarter_order"] = quarterly_df["financial_quarter"].map(
-        quarter_order
-    )
+    if value < 0:
+        return "delta-pill-negative"
 
-    quarterly_df = quarterly_df.sort_values(
-        ["segment", "instrument", "financial_year", "quarter_order"]
-    )
-
-    quarterly_df["financial_period"] = (
-        quarterly_df["financial_year"]
-        + " "
-        + quarterly_df["financial_quarter"]
-    )
-
-    quarterly_df["qoq_turnover_change"] = (
-        quarterly_df
-        .groupby(["segment", "instrument"])["average_turnover"]
-        .pct_change()
-    )
-
-    quarterly_df["qoq_volume_change"] = (
-        quarterly_df
-        .groupby(["segment", "instrument"])["average_volume"]
-        .pct_change()
-    )
-
-    return quarterly_df
+    return "delta-pill-neutral"
 
 
-def add_moving_average(df):
-    df = df.sort_values("month_date").copy()
+def get_delta_arrow(value):
+    if pd.isna(value):
+        return "→"
 
-    df["turnover_3m_ma"] = (
-        df["turnover"]
-        .rolling(window=3, min_periods=1)
-        .mean()
-    )
+    if value > 0:
+        return "↑"
 
-    df["volume_3m_ma"] = (
-        df["volume"]
-        .rolling(window=3, min_periods=1)
-        .mean()
-    )
+    if value < 0:
+        return "↓"
 
-    return df
+    return "→"
 
 
-def get_business_insight(filtered_df):
-    latest_row = filtered_df.dropna(subset=["month_date"]).tail(1)
+def format_delta(value):
+    if pd.isna(value):
+        return "No previous data"
 
-    if latest_row.empty:
-        return "No data available for selected filters."
+    arrow = get_delta_arrow(value)
+    return f"{arrow} {abs(value) * 100:,.2f}%"
 
-    latest = latest_row.iloc[0]
 
-    turnover_change = latest["mom_turnover_change"]
-    volume_change = latest["mom_volume_change"]
+def render_metric_card(label, value, delta=None):
+    delta_html = ""
 
-    if pd.isna(turnover_change) or pd.isna(volume_change):
-        return (
-            f"For {latest['month_label']}, previous month comparison is not available."
+    if delta is not None:
+        delta_class = get_delta_class(delta)
+        delta_text = format_delta(delta)
+
+        delta_html = (
+            f'<div class="{delta_class}">'
+            f'{delta_text}'
+            f'</div>'
         )
 
-    turnover_text = "increased" if turnover_change > 0 else "decreased"
-    volume_text = "increased" if volume_change > 0 else "decreased"
+    card_html = (
+        '<div class="metric-card">'
+        f'<div class="metric-label">{label}</div>'
+        f'<div class="metric-value">{value}</div>'
+        f'{delta_html}'
+        '</div>'
+    )
 
-    if turnover_change > 0 and volume_change > 0:
-        interpretation = (
-            "This indicates strong business growth because both turnover and volume improved."
-        )
-    elif turnover_change > 0 and volume_change < 0:
-        interpretation = (
-            "This indicates value growth, but trading participation weakened compared to the previous month."
-        )
-    elif turnover_change < 0 and volume_change > 0:
-        interpretation = (
-            "This indicates higher participation, but lower average business value."
-        )
-    else:
-        interpretation = (
-            "This indicates a weak month because both turnover and volume declined."
-        )
-
-    return (
-        f"In {latest['month_label']}, turnover {turnover_text} by "
-        f"{format_percent(turnover_change)} and volume {volume_text} by "
-        f"{format_percent(volume_change)}. {interpretation}"
+    st.markdown(
+        card_html,
+        unsafe_allow_html=True,
     )
 
 
-def show_data_quality_summary(df):
-    total_rows = len(df)
-    missing_turnover = df["turnover"].isna().sum()
-    missing_volume = df["volume"].isna().sum()
+def get_latest_selected_rows(df):
+    if df.empty:
+        return None, None
 
-    duplicate_rows = df.duplicated(
-        subset=[
-            "segment",
-            "instrument",
-            "month_label",
-            "financial_year",
-            "financial_quarter"
-        ]
-    ).sum()
+    ordered_df = df.sort_values("month_date").copy()
 
-    latest_month = df["month_date"].max()
-    earliest_month = df["month_date"].min()
+    latest_row = ordered_df.tail(1).iloc[0]
 
-    if pd.notna(latest_month):
-        latest_month_text = latest_month.strftime("%b-%Y")
-    else:
-        latest_month_text = "N/A"
+    previous_row = None
 
-    if pd.notna(earliest_month):
-        earliest_month_text = earliest_month.strftime("%b-%Y")
-    else:
-        earliest_month_text = "N/A"
+    if len(ordered_df) >= 2:
+        previous_row = ordered_df.iloc[-2]
 
-    st.subheader("Data Quality Summary")
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric("Total Rows", f"{total_rows}")
-    col2.metric("Missing Turnover", f"{missing_turnover}")
-    col3.metric("Missing Volume", f"{missing_volume}")
-    col4.metric("Duplicate Rows", f"{duplicate_rows}")
-
-    col5, col6, col7 = st.columns(3)
-
-    col5.metric("Earliest Month", earliest_month_text)
-    col6.metric("Latest Month", latest_month_text)
-    col7.metric("Last DB Update", get_last_updated_time())
+    return latest_row, previous_row
 
 
-def show_kpi_cards(filtered_df):
-    latest_row = filtered_df.dropna(subset=["month_date"]).tail(1)
+def calculate_change(current_value, previous_value):
+    if previous_value is None:
+        return None
 
-    if latest_row.empty:
-        st.warning("No data found for selected filters.")
-        return False
+    if pd.isna(current_value) or pd.isna(previous_value):
+        return None
 
-    latest = latest_row.iloc[0]
+    if previous_value == 0:
+        return None
 
-    total_turnover = filtered_df["turnover"].sum()
-    avg_turnover = filtered_df["turnover"].mean()
-    total_volume = filtered_df["volume"].sum()
-    avg_volume = filtered_df["volume"].mean()
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    col1.metric(
-        "Latest Month",
-        latest["month_label"]
-    )
-
-    col2.metric(
-        "Latest Turnover",
-        format_number(latest["turnover"]),
-        format_percent(latest["mom_turnover_change"])
-    )
-
-    col3.metric(
-        "Latest Volume",
-        format_number(latest["volume"]),
-        format_percent(latest["mom_volume_change"])
-    )
-
-    col4.metric(
-        "Financial Period",
-        f"{latest['financial_year']} {latest['financial_quarter']}"
-    )
-
-    st.write("")
-
-    col5, col6, col7, col8 = st.columns(4)
-
-    col5.metric(
-        "Total Turnover",
-        format_number(total_turnover)
-    )
-
-    col6.metric(
-        "Average Turnover",
-        format_number(avg_turnover)
-    )
-
-    col7.metric(
-        "Total Volume",
-        format_number(total_volume)
-    )
-
-    col8.metric(
-        "Average Volume",
-        format_number(avg_volume)
-    )
-
-    return True
+    return (current_value - previous_value) / previous_value
 
 
-def show_best_worst_cards(filtered_df):
+def get_volume_unit_text(segment):
+    if segment == "Capital Market":
+        return "Lakhs/day"
+
+    return "Contracts/day"
+
+
+def render_selected_kpis(filtered_df, selected_segment):
     if filtered_df.empty:
         return
 
-    best_turnover = filtered_df.loc[filtered_df["turnover"].idxmax()]
-    worst_turnover = filtered_df.loc[filtered_df["turnover"].idxmin()]
-    best_volume = filtered_df.loc[filtered_df["volume"].idxmax()]
-    worst_volume = filtered_df.loc[filtered_df["volume"].idxmin()]
+    latest_row, previous_row = get_latest_selected_rows(filtered_df)
 
-    st.subheader("Best / Worst Month Summary")
+    if latest_row is None:
+        return
 
-    col1, col2, col3, col4 = st.columns(4)
+    latest_turnover = latest_row["turnover"]
+    latest_volume = latest_row["volume"]
 
-    col1.metric(
-        "Highest Turnover Month",
-        best_turnover["month_label"],
-        format_number(best_turnover["turnover"])
+    turnover_delta = latest_row["mom_turnover_change"]
+    volume_delta = latest_row["mom_volume_change"]
+
+    latest_month = latest_row["month_date"].strftime("%b-%Y")
+
+    financial_period = (
+        f"{latest_row['financial_year']} "
+        f"{latest_row['financial_quarter']}"
     )
 
-    col2.metric(
-        "Lowest Turnover Month",
-        worst_turnover["month_label"],
-        format_number(worst_turnover["turnover"])
-    )
+    c1, c2, c3, c4 = st.columns(4)
 
-    col3.metric(
-        "Highest Volume Month",
-        best_volume["month_label"],
-        format_number(best_volume["volume"])
-    )
-
-    col4.metric(
-        "Lowest Volume Month",
-        worst_volume["month_label"],
-        format_number(worst_volume["volume"])
-    )
-
-
-def make_line_with_moving_average(
-    df,
-    y_actual,
-    y_ma,
-    chart_title,
-    y_axis_title,
-    actual_name,
-    ma_name
-):
-    fig = go.Figure()
-
-    fig.add_trace(
-        go.Scatter(
-            x=df["month_date"],
-            y=df[y_actual],
-            mode="lines+markers",
-            name=actual_name,
-            text=df["month_label"],
-            hovertemplate="%{text}<br>Value: %{y}<extra></extra>"
+    with c1:
+        render_metric_card(
+            "Latest Month",
+            latest_month,
         )
-    )
 
-    fig.add_trace(
-        go.Scatter(
-            x=df["month_date"],
-            y=df[y_ma],
-            mode="lines+markers",
-            name=ma_name,
-            text=df["month_label"],
-            hovertemplate="%{text}<br>3M MA: %{y}<extra></extra>"
+    with c2:
+        render_metric_card(
+            "Latest Turnover",
+            format_turnover_cr(latest_turnover),
+            turnover_delta,
         )
-    )
 
-    fig.update_layout(
-        title=chart_title,
-        xaxis_title="Month",
-        yaxis_title=y_axis_title,
-        legend_title="Metric",
-        height=450
-    )
+    with c3:
+        render_metric_card(
+            f"Latest Volume ({get_volume_unit_text(selected_segment)})",
+            format_indian_number(latest_volume),
+            volume_delta,
+        )
 
-    fig.update_xaxes(
-        tickformat="%b-%Y",
-        tickangle=-45
-    )
-
-    return fig
+    with c4:
+        render_metric_card(
+            "Financial Period",
+            financial_period,
+        )
 
 
-def add_zero_line(fig):
-    fig.add_hline(
-        y=0,
-        line_dash="dash"
-    )
-
-    fig.update_layout(
-        yaxis_tickformat=".0%",
-        bargap=0.25,
-        height=450
-    )
-
-    return fig
-
-
-def make_mom_bar_chart(
-    df,
-    y_column,
-    chart_title,
-    y_axis_title
-):
-    fig = px.bar(
-        df,
-        x="month_date",
-        y=y_column,
-        title=chart_title,
-        hover_data=[
-            "month_label",
-            "financial_year",
-            "financial_quarter"
-        ]
-    )
-
-    fig.update_layout(
-        xaxis_title="Month",
-        yaxis_title=y_axis_title,
-        yaxis_tickformat=".0%",
-        bargap=0.25,
-        height=450
-    )
-
-    fig.update_xaxes(
-        tickformat="%b-%Y",
-        tickangle=-45
-    )
-
-    fig = add_zero_line(fig)
-
-    return fig
-
-
-def make_qoq_bar_chart(
-    df,
-    y_column,
-    chart_title,
-    y_axis_title
-):
-    fig = px.bar(
-        df,
-        x="financial_period",
-        y=y_column,
-        title=chart_title,
-        hover_data=[
-            "financial_year",
-            "financial_quarter"
-        ]
-    )
-
-    fig.update_layout(
-        xaxis_title="Financial Quarter",
-        yaxis_title=y_axis_title,
-        yaxis_tickformat=".0%",
-        bargap=0.25,
-        height=450
-    )
-
-    fig.update_xaxes(
-        tickangle=-45
-    )
-
-    fig = add_zero_line(fig)
-
-    return fig
-
-
-def main():
-    st.title("📈 NSE Business Growth & Volume Dashboard")
-    st.caption("Automated dashboard using Excel → SQLite → Streamlit")
-
-    st.sidebar.header("Data Upload & Refresh")
-
-    uploaded_file = st.sidebar.file_uploader(
-        "Upload Excel File",
-        type=["xlsx"]
-    )
-
-    if uploaded_file is not None:
-        if st.sidebar.button("⬆️ Upload & Run Pipeline"):
-            saved_path = save_uploaded_excel(uploaded_file)
-
-            st.sidebar.success(
-                f"Excel file uploaded successfully: {saved_path}"
-            )
-
-            with st.spinner("Running pipeline from uploaded Excel file..."):
-                success, message = run_pipeline()
-
-            if success:
-                st.sidebar.success(message)
-                st.cache_data.clear()
-                st.rerun()
-            else:
-                st.sidebar.error(message)
-
-    if st.sidebar.button("🔄 Run Pipeline from Existing Excel"):
-        with st.spinner("Reading Excel, cleaning data, and updating database..."):
-            success, message = run_pipeline()
-
-        if success:
-            st.sidebar.success(message)
-            st.cache_data.clear()
-            st.rerun()
-        else:
-            st.sidebar.error(message)
-
-    if st.sidebar.button("♻️ Refresh Dashboard Only"):
-        st.cache_data.clear()
-        st.rerun()
-
-    st.sidebar.divider()
+def render_sidebar_filters(df):
     st.sidebar.header("Filters")
 
-    if not DB_PATH.exists():
-        st.warning("Database not found.")
-        st.info(
-            "Please upload the Excel file from the sidebar and click "
-            "'Upload & Run Pipeline'."
-        )
-        return
-
-    df = load_data()
-
-    if df.empty:
-        st.warning("No data found in database.")
-        return
-
-    quarterly_df = create_quarterly_data(df)
-
     segments = sorted(df["segment"].dropna().unique())
+
     selected_segment = st.sidebar.selectbox(
         "Segment",
-        segments
+        segments,
+        index=0,
     )
 
     segment_df = df[df["segment"] == selected_segment].copy()
 
     instruments = sorted(segment_df["instrument"].dropna().unique())
+
     selected_instrument = st.sidebar.selectbox(
         "Instrument",
-        instruments
+        instruments,
+        index=0,
     )
 
-    financial_years = sorted(segment_df["financial_year"].dropna().unique())
+    years = sorted(
+        segment_df["financial_year"].dropna().unique(),
+        reverse=True,
+    )
+
+    default_years = years[:5] if len(years) > 5 else years
+
     selected_financial_years = st.sidebar.multiselect(
         "Financial Year",
-        financial_years,
-        default=financial_years
+        years,
+        default=default_years,
     )
 
-    quarter_order_list = ["Q1", "Q2", "Q3", "Q4"]
-    available_quarters = [
-        quarter
-        for quarter in quarter_order_list
-        if quarter in segment_df["financial_quarter"].dropna().unique()
-    ]
+    quarters = ["Q1", "Q2", "Q3", "Q4"]
 
     selected_quarters = st.sidebar.multiselect(
         "Financial Quarter",
-        available_quarters,
-        default=available_quarters
+        quarters,
+        default=quarters,
     )
 
-    month_order_list = [
-        "Apr", "May", "Jun",
-        "Jul", "Aug", "Sep",
-        "Oct", "Nov", "Dec",
-        "Jan", "Feb", "Mar"
-    ]
+    st.sidebar.divider()
 
-    available_months = [
-        month
-        for month in month_order_list
-        if month in segment_df["month_name"].dropna().unique()
-    ]
-
-    selected_months = st.sidebar.multiselect(
-        "Month",
-        available_months,
-        default=available_months
+    time_range = st.sidebar.selectbox(
+        "Time Range",
+        TIME_RANGE_OPTIONS,
+        index=2,
+        help="Default is Last 5 Years for better chart readability.",
     )
 
-    filtered_df = segment_df[
-        (segment_df["instrument"] == selected_instrument)
-        & (segment_df["financial_year"].isin(selected_financial_years))
-        & (segment_df["financial_quarter"].isin(selected_quarters))
-        & (segment_df["month_name"].isin(selected_months))
+    show_moving_average = st.sidebar.checkbox(
+        "Show Moving Average",
+        value=True,
+    )
+
+    ma_window = st.sidebar.selectbox(
+        "Moving Average Window",
+        [3, 6, 12],
+        index=1,
+        help="Moving average is applied only on trend charts, not MoM/QoQ charts.",
+    )
+
+    change_cap = st.sidebar.selectbox(
+        "MoM / QoQ Display Cap",
+        [100, 200, 300, 500],
+        index=1,
+        help="Extreme percentage changes are capped visually. Tooltip still shows actual value.",
+    )
+
+    filtered_df = df[
+        (df["segment"] == selected_segment)
+        & (df["instrument"] == selected_instrument)
     ].copy()
 
-    filtered_df = filtered_df.sort_values("month_date")
-    filtered_df = add_moving_average(filtered_df)
+    if selected_financial_years:
+        filtered_df = filtered_df[
+            filtered_df["financial_year"].isin(selected_financial_years)
+        ].copy()
 
-    st.subheader(f"{selected_segment} — {selected_instrument}")
+    if selected_quarters:
+        filtered_df = filtered_df[
+            filtered_df["financial_quarter"].isin(selected_quarters)
+        ].copy()
 
-    has_data = show_kpi_cards(filtered_df)
+    filtered_df = apply_time_range_filter(
+        filtered_df,
+        time_range,
+    )
 
-    if not has_data:
+    return {
+        "selected_segment": selected_segment,
+        "selected_instrument": selected_instrument,
+        "selected_financial_years": selected_financial_years,
+        "selected_quarters": selected_quarters,
+        "time_range": time_range,
+        "show_moving_average": show_moving_average,
+        "ma_window": ma_window,
+        "change_cap": change_cap,
+        "filtered_df": filtered_df,
+    }
+
+
+def render_data_note():
+    st.markdown(
+        """
+        <div class="note-box">
+            <b>Note:</b> Turnover is shown as average daily turnover in ₹ Crores.
+            Volume for Capital Market is in Lakhs/day. Derivatives volume is in Contracts/day.
+            MoM and QoQ charts are capped visually to avoid outlier distortion.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_insight_box(filtered_df):
+    if filtered_df.empty or len(filtered_df) < 2:
         return
 
-    st.info(get_business_insight(filtered_df))
+    latest_row, previous_row = get_latest_selected_rows(filtered_df)
+
+    if latest_row is None or previous_row is None:
+        return
+
+    month = latest_row["month_date"].strftime("%b-%Y")
+
+    turnover_delta = latest_row["mom_turnover_change"]
+    volume_delta = latest_row["mom_volume_change"]
+
+    if pd.isna(turnover_delta) or pd.isna(volume_delta):
+        return
+
+    turnover_word = "increased" if turnover_delta > 0 else "decreased"
+    volume_word = "increased" if volume_delta > 0 else "decreased"
+
+    st.markdown(
+        f"""
+        <div class="insight-box">
+            In <b>{month}</b>, turnover <b>{turnover_word}</b> by
+            <b>{abs(turnover_delta) * 100:,.2f}%</b> and volume
+            <b>{volume_word}</b> by <b>{abs(volume_delta) * 100:,.2f}%</b>
+            compared to the previous month.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_overview_tab(df, filtered_df, selected_segment):
+    st.subheader("Overview Summary")
+
+    if filtered_df.empty:
+        st.warning("No data available for selected filters.")
+        return
+
+    total_turnover = filtered_df["turnover"].sum()
+    average_turnover = filtered_df["turnover"].mean()
+    total_volume = filtered_df["volume"].sum()
+    average_volume = filtered_df["volume"].mean()
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        render_metric_card(
+            "Total Turnover",
+            format_turnover_cr(total_turnover),
+        )
+
+    with c2:
+        render_metric_card(
+            "Average Turnover",
+            format_turnover_cr(average_turnover),
+        )
+
+    with c3:
+        render_metric_card(
+            f"Total Volume ({get_volume_unit_text(selected_segment)})",
+            format_indian_number(total_volume),
+        )
+
+    with c4:
+        render_metric_card(
+            f"Average Volume ({get_volume_unit_text(selected_segment)})",
+            format_indian_number(average_volume),
+        )
+
+    render_insight_box(filtered_df)
 
     st.divider()
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    st.subheader("Best / Worst Month Summary")
+
+    highest_turnover_row = filtered_df.loc[filtered_df["turnover"].idxmax()]
+    lowest_turnover_row = filtered_df.loc[filtered_df["turnover"].idxmin()]
+    highest_volume_row = filtered_df.loc[filtered_df["volume"].idxmax()]
+    lowest_volume_row = filtered_df.loc[filtered_df["volume"].idxmin()]
+
+    b1, b2, b3, b4 = st.columns(4)
+
+    with b1:
+        render_metric_card(
+            "Highest Turnover Month",
+            highest_turnover_row["month_date"].strftime("%b-%Y"),
+            highest_turnover_row["mom_turnover_change"],
+        )
+
+    with b2:
+        render_metric_card(
+            "Lowest Turnover Month",
+            lowest_turnover_row["month_date"].strftime("%b-%Y"),
+            lowest_turnover_row["mom_turnover_change"],
+        )
+
+    with b3:
+        render_metric_card(
+            "Highest Volume Month",
+            highest_volume_row["month_date"].strftime("%b-%Y"),
+            highest_volume_row["mom_volume_change"],
+        )
+
+    with b4:
+        render_metric_card(
+            "Lowest Volume Month",
+            lowest_volume_row["month_date"].strftime("%b-%Y"),
+            lowest_volume_row["mom_volume_change"],
+        )
+
+    st.divider()
+
+    c5, c6 = st.columns(2)
+
+    with c5:
+        st.plotly_chart(
+            create_monthly_turnover_chart(
+                filtered_df,
+                ma_window=6,
+                show_ma=True,
+            ),
+            width="stretch",
+            key="overview_monthly_turnover_chart",
+        )
+
+    with c6:
+        st.plotly_chart(
+            create_monthly_volume_chart(
+                filtered_df,
+                ma_window=6,
+                show_ma=True,
+            ),
+            width="stretch",
+            key="overview_monthly_volume_chart",
+        )
+
+
+def render_monthly_tab(filtered_df, ma_window, show_moving_average, change_cap):
+    st.subheader("Monthly Analysis")
+
+    if filtered_df.empty:
+        st.warning("No monthly data available for selected filters.")
+        return
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.plotly_chart(
+            create_monthly_turnover_chart(
+                filtered_df,
+                ma_window=ma_window,
+                show_ma=show_moving_average,
+            ),
+            width="stretch",
+            key="monthly_turnover_chart",
+        )
+
+    with c2:
+        st.plotly_chart(
+            create_monthly_volume_chart(
+                filtered_df,
+                ma_window=ma_window,
+                show_ma=show_moving_average,
+            ),
+            width="stretch",
+            key="monthly_volume_chart",
+        )
+
+    st.divider()
+
+    st.caption(
+        "MoM charts use green/red bars and visual capping. Moving average is intentionally not applied on MoM charts."
+    )
+
+    c3, c4 = st.columns(2)
+
+    with c3:
+        st.plotly_chart(
+            create_mom_turnover_chart(
+                filtered_df,
+                cap_percent=change_cap,
+            ),
+            width="stretch",
+            key="monthly_mom_turnover_chart",
+        )
+
+    with c4:
+        st.plotly_chart(
+            create_mom_volume_chart(
+                filtered_df,
+                cap_percent=change_cap,
+            ),
+            width="stretch",
+            key="monthly_mom_volume_chart",
+        )
+
+
+def render_quarterly_tab(filtered_df, show_moving_average, change_cap):
+    st.subheader("Quarterly Analysis")
+
+    if filtered_df.empty:
+        st.warning("No quarterly data available for selected filters.")
+        return
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        st.plotly_chart(
+            create_quarterly_turnover_chart(
+                filtered_df,
+                ma_window=4,
+                show_ma=show_moving_average,
+            ),
+            width="stretch",
+            key="quarterly_turnover_chart",
+        )
+
+    with c2:
+        st.plotly_chart(
+            create_quarterly_volume_chart(
+                filtered_df,
+                ma_window=4,
+                show_ma=show_moving_average,
+            ),
+            width="stretch",
+            key="quarterly_volume_chart",
+        )
+
+    st.divider()
+
+    st.caption(
+        "QoQ charts use green/red bars and visual capping. Moving average is intentionally not applied on QoQ charts."
+    )
+
+    c3, c4 = st.columns(2)
+
+    with c3:
+        st.plotly_chart(
+            create_qoq_turnover_chart(
+                filtered_df,
+                cap_percent=change_cap,
+            ),
+            width="stretch",
+            key="quarterly_qoq_turnover_chart",
+        )
+
+    with c4:
+        st.plotly_chart(
+            create_qoq_volume_chart(
+                filtered_df,
+                cap_percent=change_cap,
+            ),
+            width="stretch",
+            key="quarterly_qoq_volume_chart",
+        )
+
+
+def render_comparative_tab(df, base_filters):
+    st.subheader("Comparative View")
+
+    comparison_df = df.copy()
+
+    if base_filters["selected_financial_years"]:
+        comparison_df = comparison_df[
+            comparison_df["financial_year"].isin(
+                base_filters["selected_financial_years"]
+            )
+        ].copy()
+
+    if base_filters["selected_quarters"]:
+        comparison_df = comparison_df[
+            comparison_df["financial_quarter"].isin(
+                base_filters["selected_quarters"]
+            )
+        ].copy()
+
+    comparison_df = apply_time_range_filter(
+        comparison_df,
+        base_filters["time_range"],
+    )
+
+    comparison_df["pair"] = (
+        comparison_df["segment"].astype(str)
+        + " — "
+        + comparison_df["instrument"].astype(str)
+    )
+
+    available_pairs = sorted(
+        comparison_df["pair"].dropna().unique()
+    )
+
+    if not available_pairs:
+        st.warning("No data available for comparison.")
+        return
+
+    default_pairs = available_pairs[:3]
+
+    selected_pairs = st.multiselect(
+        "Select segment/instrument pairs to compare",
+        available_pairs,
+        default=default_pairs,
+        help="Choose only the pairs you want to compare. Too many lines can make the chart crowded.",
+        key="comparative_selected_pairs",
+    )
+
+    c1, c2 = st.columns(2)
+
+    with c1:
+        comparison_metric = st.radio(
+            "Metric",
+            ["turnover", "volume"],
+            horizontal=True,
+            format_func=lambda value: (
+                "Turnover" if value == "turnover" else "Volume"
+            ),
+            key="comparison_metric_radio",
+        )
+
+    with c2:
+        comparison_mode = st.radio(
+            "Comparison Mode",
+            ["Indexed Growth", "Absolute Value"],
+            horizontal=True,
+            help="Indexed Growth normalizes each selected series to 100 at the first selected period.",
+            key="comparison_mode_radio",
+        )
+
+    st.plotly_chart(
+        create_comparative_chart(
+            comparison_df,
+            selected_pairs=selected_pairs,
+            metric=comparison_metric,
+            comparison_mode=comparison_mode,
+        ),
+        width="stretch",
+        key="comparative_chart",
+    )
+
+    st.caption(
+        "Recommendation: Use Indexed Growth when comparing segments with very different scales."
+    )
+
+
+def render_data_quality_tab(df):
+    st.subheader("Data Quality")
+
+    if df.empty:
+        st.warning("No data available.")
+        return
+
+    total_rows = len(df)
+
+    duplicate_count = df.duplicated(
+        subset=["segment", "instrument", "month_label"]
+    ).sum()
+
+    missing_turnover = df["turnover"].isna().sum()
+    missing_volume = df["volume"].isna().sum()
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        render_metric_card("Total Rows", f"{total_rows:,}")
+
+    with c2:
+        render_metric_card("Duplicate Keys", f"{duplicate_count:,}")
+
+    with c3:
+        render_metric_card("Missing Turnover", f"{missing_turnover:,}")
+
+    with c4:
+        render_metric_card("Missing Volume", f"{missing_volume:,}")
+
+    st.divider()
+
+    st.write("Rows by Segment and Instrument")
+
+    summary = (
+        df.groupby(["segment", "instrument"])
+        .agg(
+            rows=("month_label", "count"),
+            start_month=("month_date", "min"),
+            end_month=("month_date", "max"),
+            avg_turnover=("turnover", "mean"),
+            avg_volume=("volume", "mean"),
+        )
+        .reset_index()
+    )
+
+    summary["start_month"] = summary["start_month"].dt.strftime("%b-%Y")
+    summary["end_month"] = summary["end_month"].dt.strftime("%b-%Y")
+
+    st.dataframe(
+        summary,
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.divider()
+
+    st.write("Raw Data Preview")
+
+    preview_df = df.sort_values(
+        ["segment", "instrument", "month_date"],
+        ascending=[True, True, False],
+    )
+
+    st.dataframe(
+        preview_df.head(500),
+        width="stretch",
+        hide_index=True,
+    )
+
+
+def render_download_section(df):
+    st.sidebar.divider()
+    st.sidebar.subheader("Download")
+
+    csv_data = df.to_csv(index=False).encode("utf-8-sig")
+
+    st.sidebar.download_button(
+        label="Download Filtered CSV",
+        data=csv_data,
+        file_name="nse_business_growth_filtered.csv",
+        mime="text/csv",
+    )
+
+
+def main():
+    inject_custom_css()
+
+    st.markdown(
+        """
+        <div class="dashboard-title">
+            📈 NSE Business Growth Dashboard
+        </div>
+        <div class="dashboard-subtitle">
+            Historical monthly business growth analysis across NSE market segments.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.sidebar.button("Refresh Dashboard Data"):
+        st.cache_data.clear()
+        st.rerun()
+
+    df = load_dashboard_data()
+
+    if df.empty:
+        st.error(
+            "No data found. Please run the data pipeline or load the SQLite database first."
+        )
+        st.stop()
+
+    filter_state = render_sidebar_filters(df)
+    filtered_df = filter_state["filtered_df"]
+
+    render_download_section(filtered_df)
+    render_data_note()
+
+    render_selected_kpis(
+        filtered_df=filtered_df,
+        selected_segment=filter_state["selected_segment"],
+    )
+
+    st.divider()
+
+    selected_label = (
+        f"{filter_state['selected_segment']} — "
+        f"{filter_state['selected_instrument']} | "
+        f"{filter_state['time_range']}"
+    )
+
+    st.markdown(f"### Current Selection: `{selected_label}`")
+
+    tabs = st.tabs(
         [
             "Overview",
             "Monthly Analysis",
             "Quarterly Analysis",
             "Comparative View",
-            "Data Quality"
+            "Data Quality",
         ]
     )
 
-    with tab1:
-        st.subheader("Overview Summary")
-
-        show_best_worst_cards(filtered_df)
-
-        st.write("")
-
-        fy_summary = (
-            filtered_df
-            .groupby("financial_year", as_index=False)
-            .agg(
-                total_turnover=("turnover", "sum"),
-                average_turnover=("turnover", "mean"),
-                total_volume=("volume", "sum"),
-                average_volume=("volume", "mean")
-            )
+    with tabs[0]:
+        render_overview_tab(
+            df=df,
+            filtered_df=filtered_df,
+            selected_segment=filter_state["selected_segment"],
         )
 
-        st.subheader("Financial Year Summary")
-
-        st.dataframe(
-            format_dataframe_for_display(fy_summary),
-            use_container_width=True
+    with tabs[1]:
+        render_monthly_tab(
+            filtered_df=filtered_df,
+            ma_window=filter_state["ma_window"],
+            show_moving_average=filter_state["show_moving_average"],
+            change_cap=filter_state["change_cap"],
         )
 
-        st.download_button(
-            label="⬇️ Download FY Summary",
-            data=fy_summary.to_csv(index=False),
-            file_name="nse_financial_year_summary.csv",
-            mime="text/csv"
+    with tabs[2]:
+        render_quarterly_tab(
+            filtered_df=filtered_df,
+            show_moving_average=filter_state["show_moving_average"],
+            change_cap=filter_state["change_cap"],
         )
 
-    with tab2:
-        st.subheader("Monthly Performance with 3-Month Moving Average")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            fig_turnover = make_line_with_moving_average(
-                df=filtered_df,
-                y_actual="turnover",
-                y_ma="turnover_3m_ma",
-                chart_title="Monthly Average Turnover + 3M Moving Average",
-                y_axis_title="Turnover",
-                actual_name="Actual Turnover",
-                ma_name="3M Moving Average"
-            )
-
-            st.plotly_chart(fig_turnover, use_container_width=True)
-
-        with col2:
-            fig_volume = make_line_with_moving_average(
-                df=filtered_df,
-                y_actual="volume",
-                y_ma="volume_3m_ma",
-                chart_title="Average Volume + 3M Moving Average",
-                y_axis_title="Volume",
-                actual_name="Actual Volume",
-                ma_name="3M Moving Average"
-            )
-
-            st.plotly_chart(fig_volume, use_container_width=True)
-
-        col3, col4 = st.columns(2)
-
-        with col3:
-            fig_mom_turnover = make_mom_bar_chart(
-                df=filtered_df,
-                y_column="mom_turnover_change",
-                chart_title="MoM % Change — Turnover",
-                y_axis_title="MoM Change"
-            )
-
-            st.plotly_chart(fig_mom_turnover, use_container_width=True)
-
-        with col4:
-            fig_mom_volume = make_mom_bar_chart(
-                df=filtered_df,
-                y_column="mom_volume_change",
-                chart_title="MoM % Change — Volume",
-                y_axis_title="MoM Change"
-            )
-
-            st.plotly_chart(fig_mom_volume, use_container_width=True)
-
-        st.subheader("Monthly Data Preview")
-
-        st.download_button(
-            label="⬇️ Download Filtered Monthly Data",
-            data=filtered_df.to_csv(index=False),
-            file_name="nse_filtered_monthly_data.csv",
-            mime="text/csv"
+    with tabs[3]:
+        render_comparative_tab(
+            df=df,
+            base_filters=filter_state,
         )
 
-        st.dataframe(
-            format_dataframe_for_display(filtered_df),
-            use_container_width=True
-        )
-
-    with tab3:
-        st.subheader("Quarterly Performance")
-
-        selected_quarterly_df = quarterly_df[
-            (quarterly_df["segment"] == selected_segment)
-            & (quarterly_df["instrument"] == selected_instrument)
-            & (quarterly_df["financial_year"].isin(selected_financial_years))
-            & (quarterly_df["financial_quarter"].isin(selected_quarters))
-        ].copy()
-
-        selected_quarterly_df = selected_quarterly_df.sort_values(
-            ["financial_year", "quarter_order"]
-        )
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-            fig_q_turnover = px.line(
-                selected_quarterly_df,
-                x="financial_period",
-                y="average_turnover",
-                markers=True,
-                title="Quarterly Average Turnover"
-            )
-
-            fig_q_turnover.update_layout(
-                xaxis_title="Financial Quarter",
-                yaxis_title="Average Turnover",
-                height=450
-            )
-
-            fig_q_turnover.update_xaxes(
-                tickangle=-45
-            )
-
-            st.plotly_chart(fig_q_turnover, use_container_width=True)
-
-        with col2:
-            fig_q_volume = px.line(
-                selected_quarterly_df,
-                x="financial_period",
-                y="average_volume",
-                markers=True,
-                title="Quarterly Average Volume"
-            )
-
-            fig_q_volume.update_layout(
-                xaxis_title="Financial Quarter",
-                yaxis_title="Average Volume",
-                height=450
-            )
-
-            fig_q_volume.update_xaxes(
-                tickangle=-45
-            )
-
-            st.plotly_chart(fig_q_volume, use_container_width=True)
-
-        col3, col4 = st.columns(2)
-
-        with col3:
-            fig_qoq_turnover = make_qoq_bar_chart(
-                df=selected_quarterly_df,
-                y_column="qoq_turnover_change",
-                chart_title="QoQ % Change — Turnover",
-                y_axis_title="QoQ Change"
-            )
-
-            st.plotly_chart(fig_qoq_turnover, use_container_width=True)
-
-        with col4:
-            fig_qoq_volume = make_qoq_bar_chart(
-                df=selected_quarterly_df,
-                y_column="qoq_volume_change",
-                chart_title="QoQ % Change — Volume",
-                y_axis_title="QoQ Change"
-            )
-
-            st.plotly_chart(fig_qoq_volume, use_container_width=True)
-
-        st.subheader("Quarterly Data Preview")
-
-        st.download_button(
-            label="⬇️ Download Quarterly Data",
-            data=selected_quarterly_df.to_csv(index=False),
-            file_name="nse_quarterly_data.csv",
-            mime="text/csv"
-        )
-
-        st.dataframe(
-            format_dataframe_for_display(selected_quarterly_df),
-            use_container_width=True
-        )
-
-    with tab4:
-        st.subheader("Comparative View")
-
-        comparison_df = df.copy()
-
-        if selected_financial_years:
-            comparison_df = comparison_df[
-                comparison_df["financial_year"].isin(selected_financial_years)
-            ]
-
-        if selected_quarters:
-            comparison_df = comparison_df[
-                comparison_df["financial_quarter"].isin(selected_quarters)
-            ]
-
-        if selected_months:
-            comparison_df = comparison_df[
-                comparison_df["month_name"].isin(selected_months)
-            ]
-
-        comparison_df = comparison_df.sort_values("month_date")
-
-        fig_compare = px.line(
-            comparison_df,
-            x="month_date",
-            y="turnover",
-            color="segment",
-            line_dash="instrument",
-            markers=True,
-            hover_data=[
-                "month_label",
-                "instrument",
-                "financial_year",
-                "financial_quarter"
-            ],
-            title="Turnover Comparison Across Segments"
-        )
-
-        fig_compare.update_layout(
-            xaxis_title="Month",
-            yaxis_title="Turnover",
-            height=500
-        )
-
-        fig_compare.update_xaxes(
-            tickformat="%b-%Y",
-            tickangle=-45
-        )
-
-        st.plotly_chart(fig_compare, use_container_width=True)
-
-        st.subheader("Segment Ranking")
-
-        ranking_df = (
-            comparison_df
-            .groupby(["segment", "instrument"], as_index=False)
-            .agg(
-                total_turnover=("turnover", "sum"),
-                average_turnover=("turnover", "mean"),
-                total_volume=("volume", "sum"),
-                average_volume=("volume", "mean")
-            )
-            .sort_values("total_turnover", ascending=False)
-        )
-
-        ranking_df["rank"] = range(1, len(ranking_df) + 1)
-
-        ranking_df = ranking_df[
-            [
-                "rank",
-                "segment",
-                "instrument",
-                "total_turnover",
-                "average_turnover",
-                "total_volume",
-                "average_volume"
-            ]
-        ]
-
-        st.dataframe(
-            format_dataframe_for_display(ranking_df),
-            use_container_width=True
-        )
-
-        st.subheader("YoY Growth — Same Month Across Financial Years")
-
-        yoy_df = df.copy()
-        yoy_df["month_name"] = yoy_df["month_date"].dt.strftime("%b")
-
-        yoy_filtered = yoy_df[
-            (yoy_df["segment"] == selected_segment)
-            & (yoy_df["instrument"] == selected_instrument)
-            & (yoy_df["financial_year"].isin(selected_financial_years))
-        ].copy()
-
-        fig_yoy = px.bar(
-            yoy_filtered,
-            x="month_name",
-            y="turnover",
-            color="financial_year",
-            barmode="group",
-            title=f"YoY Turnover Comparison — {selected_segment} / {selected_instrument}"
-        )
-
-        fig_yoy.update_layout(
-            xaxis_title="Month",
-            yaxis_title="Turnover",
-            height=450
-        )
-
-        st.plotly_chart(fig_yoy, use_container_width=True)
-
-        st.subheader("Comparison Data Preview")
-
-        st.download_button(
-            label="⬇️ Download Comparison Data",
-            data=comparison_df.to_csv(index=False),
-            file_name="nse_comparison_data.csv",
-            mime="text/csv"
-        )
-
-        st.dataframe(
-            format_dataframe_for_display(comparison_df),
-            use_container_width=True
-        )
-
-    with tab5:
-        show_data_quality_summary(df)
-
-        st.subheader("Raw Database Preview")
-
-        st.dataframe(
-            format_dataframe_for_display(df),
-            use_container_width=True
-        )
+    with tabs[4]:
+        render_data_quality_tab(df)
 
 
 if __name__ == "__main__":
