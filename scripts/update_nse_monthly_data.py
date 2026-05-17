@@ -1,5 +1,6 @@
 import sys
 import re
+import os
 from pathlib import Path
 from datetime import datetime
 
@@ -38,6 +39,10 @@ NSE_SEGMENT_URLS = {
         "url": "https://www.nseindia.com/market-data/business-growth-interest-rate-derivative",
     },
 }
+
+
+def is_ci_environment():
+    return os.getenv("CI", "false").lower() == "true"
 
 
 def clean_number(value):
@@ -97,10 +102,13 @@ def get_financial_quarter(month_date):
 
     if month in [4, 5, 6]:
         return "Q1"
+
     if month in [7, 8, 9]:
         return "Q2"
+
     if month in [10, 11, 12]:
         return "Q3"
+
     if month in [1, 2, 3]:
         return "Q4"
 
@@ -280,10 +288,12 @@ def scrape_latest_raw_data(years_to_scrape=2):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=False,
+            headless=is_ci_environment(),
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--start-maximized",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
             ],
         )
 

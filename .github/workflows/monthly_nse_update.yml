@@ -1,0 +1,64 @@
+name: Monthly NSE Data Update
+
+on:
+  schedule:
+    # Runs on 5th day of every month at 09:00 AM IST
+    # GitHub cron uses UTC, so 03:30 UTC = 09:00 IST
+    - cron: "30 3 5 * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-nse-data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: |
+          python -m playwright install chromium
+          python -m playwright install-deps chromium
+
+      - name: Run monthly NSE data update
+        env:
+          CI: "true"
+        run: |
+          python scripts/update_nse_monthly_data.py
+
+      - name: Load updated NSE data into SQLite
+        run: |
+          python scripts/load_nse_history_to_db.py
+
+      - name: Show updated files
+        run: |
+          git status
+
+      - name: Commit updated dataset and database
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add data/processed/clean_nse_business_growth_from_nse.csv
+          git add data/nse_business_growth.db
+
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
+          else
+            git commit -m "Monthly NSE data update"
+            git push
+          fi
