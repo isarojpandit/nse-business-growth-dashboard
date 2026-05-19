@@ -47,7 +47,6 @@ The dashboard currently focuses on monthly and quarterly business growth analysi
 - Comparative segment analysis
 - Indexed growth comparison
 - Data quality summary
-- Indian number formatting using K, L, and Cr
 - GitHub Actions CI workflow
 - Monthly update workflow structure
 
