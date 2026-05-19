@@ -29,6 +29,22 @@ CSV_PATH = PROJECT_ROOT / "data" / "processed" / "clean_nse_business_growth_from
 TABLE_NAME = "nse_business_growth"
 
 
+MONTH_ORDER = {
+    "Apr": 1,
+    "May": 2,
+    "Jun": 3,
+    "Jul": 4,
+    "Aug": 5,
+    "Sep": 6,
+    "Oct": 7,
+    "Nov": 8,
+    "Dec": 9,
+    "Jan": 10,
+    "Feb": 11,
+    "Mar": 12,
+}
+
+
 st.set_page_config(
     page_title="NSE Business Growth Dashboard",
     page_icon="📈",
@@ -74,15 +90,9 @@ def inject_custom_css():
             }
 
             @keyframes titleGradient {
-                0% {
-                    background-position: 0% 50%;
-                }
-                50% {
-                    background-position: 100% 50%;
-                }
-                100% {
-                    background-position: 0% 50%;
-                }
+                0% { background-position: 0% 50%; }
+                50% { background-position: 100% 50%; }
+                100% { background-position: 0% 50%; }
             }
 
             .dashboard-subtitle {
@@ -263,6 +273,8 @@ def clean_loaded_data(df):
         errors="coerce",
     ).astype("Int64")
 
+    df["month_name"] = df["month_date"].dt.strftime("%b")
+
     df = df.sort_values(
         ["segment", "instrument", "month_date"]
     )
@@ -312,13 +324,6 @@ def format_turnover_cr(value):
         return f"₹ {value / 1_000:,.2f}K Cr"
 
     return f"₹ {value:,.2f} Cr"
-
-
-def format_percent(value):
-    if pd.isna(value):
-        return "-"
-
-    return f"{value * 100:,.2f}%"
 
 
 def get_delta_class(value):
@@ -387,7 +392,6 @@ def get_latest_selected_rows(df):
         return None, None
 
     ordered_df = df.sort_values("month_date").copy()
-
     latest_row = ordered_df.tail(1).iloc[0]
 
     previous_row = None
@@ -396,19 +400,6 @@ def get_latest_selected_rows(df):
         previous_row = ordered_df.iloc[-2]
 
     return latest_row, previous_row
-
-
-def calculate_change(current_value, previous_value):
-    if previous_value is None:
-        return None
-
-    if pd.isna(current_value) or pd.isna(previous_value):
-        return None
-
-    if previous_value == 0:
-        return None
-
-    return (current_value - previous_value) / previous_value
 
 
 def get_volume_unit_text(segment):
@@ -490,17 +481,32 @@ def render_sidebar_filters(df):
         index=0,
     )
 
+    instrument_df = segment_df[
+        segment_df["instrument"] == selected_instrument
+    ].copy()
+
     years = sorted(
-        segment_df["financial_year"].dropna().unique(),
+        instrument_df["financial_year"].dropna().unique(),
         reverse=True,
     )
-
-    default_years = years[:5] if len(years) > 5 else years
 
     selected_financial_years = st.sidebar.multiselect(
         "Financial Year",
         years,
-        default=default_years,
+        default=years,
+        help="All available financial years are selected by default.",
+    )
+
+    available_months = sorted(
+        instrument_df["month_name"].dropna().unique(),
+        key=lambda month: MONTH_ORDER.get(month, 99),
+    )
+
+    selected_months = st.sidebar.multiselect(
+        "Month",
+        available_months,
+        default=available_months,
+        help="Select specific months if you want seasonal/month-wise analysis.",
     )
 
     quarters = ["Q1", "Q2", "Q3", "Q4"]
@@ -525,11 +531,11 @@ def render_sidebar_filters(df):
         value=True,
     )
 
-    ma_window = st.sidebar.selectbox(
+    ma_window = st.sidebar.select_slider(
         "Moving Average Window",
-        [3, 6, 12],
-        index=1,
-        help="Moving average is applied only on trend charts, not MoM/QoQ charts.",
+        options=list(range(2, 13)),
+        value=6,
+        help="Moving average window from 2 to 12. Applied only on trend charts.",
     )
 
     change_cap = st.sidebar.selectbox(
@@ -549,6 +555,11 @@ def render_sidebar_filters(df):
             filtered_df["financial_year"].isin(selected_financial_years)
         ].copy()
 
+    if selected_months:
+        filtered_df = filtered_df[
+            filtered_df["month_name"].isin(selected_months)
+        ].copy()
+
     if selected_quarters:
         filtered_df = filtered_df[
             filtered_df["financial_quarter"].isin(selected_quarters)
@@ -563,6 +574,7 @@ def render_sidebar_filters(df):
         "selected_segment": selected_segment,
         "selected_instrument": selected_instrument,
         "selected_financial_years": selected_financial_years,
+        "selected_months": selected_months,
         "selected_quarters": selected_quarters,
         "time_range": time_range,
         "show_moving_average": show_moving_average,
@@ -618,7 +630,7 @@ def render_insight_box(filtered_df):
     )
 
 
-def render_overview_tab(df, filtered_df, selected_segment):
+def render_overview_tab(df, filtered_df, selected_segment, ma_window, show_moving_average):
     st.subheader("Overview Summary")
 
     if filtered_df.empty:
@@ -705,8 +717,8 @@ def render_overview_tab(df, filtered_df, selected_segment):
         st.plotly_chart(
             create_monthly_turnover_chart(
                 filtered_df,
-                ma_window=6,
-                show_ma=True,
+                ma_window=ma_window,
+                show_ma=show_moving_average,
             ),
             width="stretch",
             key="overview_monthly_turnover_chart",
@@ -716,8 +728,8 @@ def render_overview_tab(df, filtered_df, selected_segment):
         st.plotly_chart(
             create_monthly_volume_chart(
                 filtered_df,
-                ma_window=6,
-                show_ma=True,
+                ma_window=ma_window,
+                show_ma=show_moving_average,
             ),
             width="stretch",
             key="overview_monthly_volume_chart",
@@ -784,7 +796,7 @@ def render_monthly_tab(filtered_df, ma_window, show_moving_average, change_cap):
         )
 
 
-def render_quarterly_tab(filtered_df, show_moving_average, change_cap):
+def render_quarterly_tab(filtered_df, ma_window, show_moving_average, change_cap):
     st.subheader("Quarterly Analysis")
 
     if filtered_df.empty:
@@ -797,7 +809,7 @@ def render_quarterly_tab(filtered_df, show_moving_average, change_cap):
         st.plotly_chart(
             create_quarterly_turnover_chart(
                 filtered_df,
-                ma_window=4,
+                ma_window=ma_window,
                 show_ma=show_moving_average,
             ),
             width="stretch",
@@ -808,7 +820,7 @@ def render_quarterly_tab(filtered_df, show_moving_average, change_cap):
         st.plotly_chart(
             create_quarterly_volume_chart(
                 filtered_df,
-                ma_window=4,
+                ma_window=ma_window,
                 show_ma=show_moving_average,
             ),
             width="stretch",
@@ -853,6 +865,13 @@ def render_comparative_tab(df, base_filters):
         comparison_df = comparison_df[
             comparison_df["financial_year"].isin(
                 base_filters["selected_financial_years"]
+            )
+        ].copy()
+
+    if base_filters["selected_months"]:
+        comparison_df = comparison_df[
+            comparison_df["month_name"].isin(
+                base_filters["selected_months"]
             )
         ].copy()
 
@@ -1078,6 +1097,8 @@ def main():
             df=df,
             filtered_df=filtered_df,
             selected_segment=filter_state["selected_segment"],
+            ma_window=filter_state["ma_window"],
+            show_moving_average=filter_state["show_moving_average"],
         )
 
     with tabs[1]:
@@ -1091,6 +1112,7 @@ def main():
     with tabs[2]:
         render_quarterly_tab(
             filtered_df=filtered_df,
+            ma_window=filter_state["ma_window"],
             show_moving_average=filter_state["show_moving_average"],
             change_cap=filter_state["change_cap"],
         )
