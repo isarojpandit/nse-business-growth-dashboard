@@ -1,5 +1,10 @@
 # NSE Business Growth Dashboard
 
+![CI](https://github.com/isarojpandit/nse-business-growth-dashboard/actions/workflows/ci.yml/badge.svg)
+![Monthly NSE Update](https://github.com/isarojpandit/nse-business-growth-dashboard/actions/workflows/monthly_nse_update.yml/badge.svg)
+![Streamlit](https://img.shields.io/badge/Streamlit-Live%20App-red?logo=streamlit)
+![Python](https://img.shields.io/badge/Python-3.13-blue?logo=python)
+
 A production-ready Streamlit dashboard for analyzing NSE business growth across major market segments using automated data scraping, cleaning, normalization, SQLite storage, and interactive visual analytics.
 
 ## Live Demo
