@@ -11,6 +11,11 @@ TIME_RANGE_OPTIONS = [
 ]
 
 
+DEFAULT_CHART_HEIGHT = 520
+CHANGE_CHART_HEIGHT = 460
+COMPARATIVE_CHART_HEIGHT = 620
+
+
 def prepare_month_date(df):
     df = df.copy()
     df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
@@ -47,45 +52,74 @@ def get_volume_axis_label(df):
     segments = set(df["segment"].dropna().unique())
 
     if len(segments) == 1 and "Capital Market" in segments:
-        return "Average Daily Volume (Lakhs)"
+        return "Average Daily Volume (Lakhs/day)"
 
     if "Capital Market" in segments and len(segments) > 1:
-        return "Average Daily Volume (Lakhs / Contracts)"
+        return "Average Daily Volume (Lakhs/day / Contracts/day)"
 
-    return "Average Daily Volume (Contracts)"
+    return "Average Daily Volume (Contracts/day)"
 
 
-def format_large_axis(fig):
+def format_chart_layout(
+    fig,
+    height=DEFAULT_CHART_HEIGHT,
+    show_range_slider=True,
+    show_range_selector=True,
+):
     fig.update_layout(
+        height=height,
         hovermode="x unified",
-        margin=dict(l=20, r=20, t=60, b=40),
+        template="plotly_white",
+        margin=dict(l=30, r=25, t=75, b=45),
+        title=dict(
+            x=0.02,
+            xanchor="left",
+            font=dict(size=18),
+        ),
         legend=dict(
             orientation="h",
             yanchor="bottom",
-            y=1.02,
+            y=1.04,
             xanchor="right",
             x=1,
+            font=dict(size=11),
         ),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
     )
 
-    fig.update_xaxes(
-        rangeslider=dict(visible=True),
-        rangeselector=dict(
+    if show_range_selector:
+        rangeselector = dict(
             buttons=[
                 dict(count=1, label="1Y", step="year", stepmode="backward"),
                 dict(count=3, label="3Y", step="year", stepmode="backward"),
                 dict(count=5, label="5Y", step="year", stepmode="backward"),
                 dict(count=10, label="10Y", step="year", stepmode="backward"),
                 dict(step="all", label="Full"),
-            ]
-        ),
+            ],
+            bgcolor="#f8fafc",
+            activecolor="#dbeafe",
+        )
+    else:
+        rangeselector = None
+
+    fig.update_xaxes(
+        rangeslider=dict(visible=show_range_slider),
+        rangeselector=rangeselector,
         showgrid=True,
+        gridcolor="#e5e7eb",
+        tickfont=dict(size=11),
+        title_font=dict(size=12),
     )
 
     fig.update_yaxes(
         autorange=True,
         showgrid=True,
+        gridcolor="#e5e7eb",
         zeroline=True,
+        zerolinecolor="#94a3b8",
+        tickfont=dict(size=11),
+        title_font=dict(size=12),
     )
 
     return fig
@@ -117,7 +151,7 @@ def create_monthly_turnover_chart(df, ma_window=6, show_ma=True):
             y=df["turnover"],
             mode="lines+markers",
             name="Actual Turnover",
-            line=dict(width=2),
+            line=dict(width=2.2),
             marker=dict(size=5),
             hovertemplate=(
                 "Month=%{x|%b-%Y}<br>"
@@ -126,6 +160,8 @@ def create_monthly_turnover_chart(df, ma_window=6, show_ma=True):
             ),
         )
     )
+
+    title = "Monthly Average Turnover"
 
     if show_ma:
         df, ma_col = add_moving_average(df, "turnover", ma_window)
@@ -145,13 +181,20 @@ def create_monthly_turnover_chart(df, ma_window=6, show_ma=True):
             )
         )
 
+        title = f"Monthly Average Turnover with {ma_window}M Moving Average"
+
     fig.update_layout(
-        title=f"Monthly Average Turnover with {ma_window}M Moving Average",
+        title=title,
         xaxis_title="Month",
         yaxis_title="Average Daily Turnover (₹ Cr)",
     )
 
-    return format_large_axis(fig)
+    return format_chart_layout(
+        fig,
+        height=DEFAULT_CHART_HEIGHT,
+        show_range_slider=True,
+        show_range_selector=True,
+    )
 
 
 def create_monthly_volume_chart(df, ma_window=6, show_ma=True):
@@ -168,7 +211,7 @@ def create_monthly_volume_chart(df, ma_window=6, show_ma=True):
             y=df["volume"],
             mode="lines+markers",
             name="Actual Volume",
-            line=dict(width=2),
+            line=dict(width=2.2),
             marker=dict(size=5),
             hovertemplate=(
                 "Month=%{x|%b-%Y}<br>"
@@ -177,6 +220,8 @@ def create_monthly_volume_chart(df, ma_window=6, show_ma=True):
             ),
         )
     )
+
+    title = "Monthly Average Volume"
 
     if show_ma:
         df, ma_col = add_moving_average(df, "volume", ma_window)
@@ -196,13 +241,20 @@ def create_monthly_volume_chart(df, ma_window=6, show_ma=True):
             )
         )
 
+        title = f"Monthly Average Volume with {ma_window}M Moving Average"
+
     fig.update_layout(
-        title=f"Monthly Average Volume with {ma_window}M Moving Average",
+        title=title,
         xaxis_title="Month",
         yaxis_title=volume_label,
     )
 
-    return format_large_axis(fig)
+    return format_chart_layout(
+        fig,
+        height=DEFAULT_CHART_HEIGHT,
+        show_range_slider=True,
+        show_range_selector=True,
+    )
 
 
 def create_change_bar_chart(
@@ -217,15 +269,29 @@ def create_change_bar_chart(
 
     df["actual_change_pct"] = df[change_col] * 100
 
-    cap_value = cap_percent
+    df = df.dropna(subset=["actual_change_pct"])
+
+    if df.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            title=f"{title} — No data available",
+            xaxis_title="Month",
+            yaxis_title=yaxis_title,
+        )
+        return format_chart_layout(
+            fig,
+            height=CHANGE_CHART_HEIGHT,
+            show_range_slider=False,
+            show_range_selector=False,
+        )
 
     df["display_change_pct"] = df["actual_change_pct"].clip(
-        lower=-cap_value,
-        upper=cap_value,
+        lower=-cap_percent,
+        upper=cap_percent,
     )
 
     df["bar_color"] = df["actual_change_pct"].apply(
-        lambda value: "#2ca02c" if value >= 0 else "#d62728"
+        lambda value: "#16a34a" if value >= 0 else "#dc2626"
     )
 
     fig = go.Figure()
@@ -250,17 +316,22 @@ def create_change_bar_chart(
         y=0,
         line_width=1,
         line_dash="dash",
-        line_color="black",
+        line_color="#334155",
     )
 
     fig.update_layout(
-        title=f"{title} (Capped at ±{cap_percent}%)",
+        title=f"{title} (Display capped at ±{cap_percent}%)",
         xaxis_title="Month",
         yaxis_title=yaxis_title,
         showlegend=False,
     )
 
-    return format_large_axis(fig)
+    return format_chart_layout(
+        fig,
+        height=CHANGE_CHART_HEIGHT,
+        show_range_slider=False,
+        show_range_selector=True,
+    )
 
 
 def create_mom_turnover_chart(df, cap_percent=200):
@@ -348,6 +419,8 @@ def create_quarterly_turnover_chart(df, ma_window=4, show_ma=True):
             y=quarter_df["average_turnover"],
             mode="lines+markers",
             name="Quarterly Avg Turnover",
+            marker=dict(size=6),
+            line=dict(width=2.2),
             hovertemplate=(
                 "Quarter=%{customdata}<br>"
                 "Turnover=%{y:,.2f} ₹ Cr"
@@ -356,6 +429,8 @@ def create_quarterly_turnover_chart(df, ma_window=4, show_ma=True):
             customdata=quarter_df["financial_period"],
         )
     )
+
+    title = "Quarterly Average Turnover"
 
     if show_ma:
         quarter_df = quarter_df.sort_values("quarter_start")
@@ -372,16 +447,29 @@ def create_quarterly_turnover_chart(df, ma_window=4, show_ma=True):
                 mode="lines",
                 name=f"{ma_window}Q Moving Average",
                 line=dict(width=3, dash="dot"),
+                hovertemplate=(
+                    "Quarter=%{customdata}<br>"
+                    f"{ma_window}Q MA=%{{y:,.2f}} ₹ Cr"
+                    "<extra></extra>"
+                ),
+                customdata=quarter_df["financial_period"],
             )
         )
 
+        title = f"Quarterly Average Turnover with {ma_window}Q Moving Average"
+
     fig.update_layout(
-        title=f"Quarterly Average Turnover with {ma_window}Q Moving Average",
+        title=title,
         xaxis_title="Financial Quarter",
         yaxis_title="Average Daily Turnover (₹ Cr)",
     )
 
-    return format_large_axis(fig)
+    return format_chart_layout(
+        fig,
+        height=DEFAULT_CHART_HEIGHT,
+        show_range_slider=True,
+        show_range_selector=True,
+    )
 
 
 def create_quarterly_volume_chart(df, ma_window=4, show_ma=True):
@@ -397,6 +485,8 @@ def create_quarterly_volume_chart(df, ma_window=4, show_ma=True):
             y=quarter_df["average_volume"],
             mode="lines+markers",
             name="Quarterly Avg Volume",
+            marker=dict(size=6),
+            line=dict(width=2.2),
             hovertemplate=(
                 "Quarter=%{customdata}<br>"
                 "Volume=%{y:,.2f}"
@@ -405,6 +495,8 @@ def create_quarterly_volume_chart(df, ma_window=4, show_ma=True):
             customdata=quarter_df["financial_period"],
         )
     )
+
+    title = "Quarterly Average Volume"
 
     if show_ma:
         quarter_df = quarter_df.sort_values("quarter_start")
@@ -421,16 +513,29 @@ def create_quarterly_volume_chart(df, ma_window=4, show_ma=True):
                 mode="lines",
                 name=f"{ma_window}Q Moving Average",
                 line=dict(width=3, dash="dot"),
+                hovertemplate=(
+                    "Quarter=%{customdata}<br>"
+                    f"{ma_window}Q MA=%{{y:,.2f}}"
+                    "<extra></extra>"
+                ),
+                customdata=quarter_df["financial_period"],
             )
         )
 
+        title = f"Quarterly Average Volume with {ma_window}Q Moving Average"
+
     fig.update_layout(
-        title=f"Quarterly Average Volume with {ma_window}Q Moving Average",
+        title=title,
         xaxis_title="Financial Quarter",
         yaxis_title=volume_label,
     )
 
-    return format_large_axis(fig)
+    return format_chart_layout(
+        fig,
+        height=DEFAULT_CHART_HEIGHT,
+        show_range_slider=True,
+        show_range_selector=True,
+    )
 
 
 def create_qoq_turnover_chart(df, cap_percent=200):
@@ -487,8 +592,17 @@ def create_comparative_chart(
 
     if df.empty:
         fig = go.Figure()
-        fig.update_layout(title="No data available for selected comparison")
-        return fig
+        fig.update_layout(
+            title="No data available for selected comparison",
+            xaxis_title="Month",
+            yaxis_title="Value",
+        )
+        return format_chart_layout(
+            fig,
+            height=COMPARATIVE_CHART_HEIGHT,
+            show_range_slider=False,
+            show_range_selector=False,
+        )
 
     metric_label = (
         "Average Daily Turnover (₹ Cr)"
@@ -537,6 +651,7 @@ def create_comparative_chart(
                 mode="lines+markers",
                 name=pair,
                 marker=dict(size=5),
+                line=dict(width=2.2),
                 hovertemplate=(
                     "Month=%{x|%b-%Y}<br>"
                     "Value=%{y:,.2f}<br>"
@@ -552,4 +667,9 @@ def create_comparative_chart(
         yaxis_title=yaxis_title,
     )
 
-    return format_large_axis(fig)
+    return format_chart_layout(
+        fig,
+        height=COMPARATIVE_CHART_HEIGHT,
+        show_range_slider=True,
+        show_range_selector=True,
+    )
