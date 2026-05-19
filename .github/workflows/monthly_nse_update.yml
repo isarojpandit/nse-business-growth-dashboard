@@ -31,14 +31,13 @@ jobs:
 
       - name: Install Playwright Chromium
         run: |
-          python -m playwright install chromium
-          python -m playwright install-deps chromium
+          python -m playwright install chromium --with-deps
 
       - name: Run monthly NSE data update
         env:
-          CI: "true"
+          PLAYWRIGHT_HEADLESS: "false"
         run: |
-          python scripts/update_nse_monthly_data.py
+          xvfb-run -a python scripts/update_nse_monthly_data.py
 
       - name: Load updated NSE data into SQLite
         run: |

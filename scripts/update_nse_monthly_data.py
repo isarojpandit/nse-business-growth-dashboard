@@ -41,9 +41,9 @@ NSE_SEGMENT_URLS = {
 }
 
 
-def is_ci_environment():
-    return os.getenv("CI", "false").lower() == "true"
 
+def should_run_headless():
+    return os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true"
 
 def clean_number(value):
     if value is None or pd.isna(value):
@@ -288,7 +288,7 @@ def scrape_latest_raw_data(years_to_scrape=2):
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
-            headless=is_ci_environment(),
+            headless=should_run_headless(),
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--start-maximized",
