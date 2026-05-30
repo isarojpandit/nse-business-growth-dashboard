@@ -949,7 +949,7 @@ def render_data_quality_tab(df):
     c1, c2, c3, c4 = st.columns(4)
 
     with c1:
-        render_metric_card("Total Rows", f"{total_rows:,}")
+        render_metric_card("Clean Monthly Rows", f"{total_rows:,}")
 
     with c2:
         render_metric_card("Duplicate Keys", f"{duplicate_count:,}")
@@ -987,15 +987,75 @@ def render_data_quality_tab(df):
 
     st.divider()
 
-    st.write("Raw Data Preview")
+    st.write("Main Clean Data Review")
 
-    preview_df = df.sort_values(
+    review_df = df.copy()
+
+    review_segments = sorted(review_df["segment"].dropna().unique())
+
+    selected_review_segments = st.multiselect(
+        "Review Segment Filter",
+        review_segments,
+        default=review_segments,
+        key="main_review_segment_filter",
+    )
+
+    if selected_review_segments:
+        review_df = review_df[
+            review_df["segment"].isin(selected_review_segments)
+        ].copy()
+
+    review_instruments = sorted(review_df["instrument"].dropna().unique())
+
+    selected_review_instruments = st.multiselect(
+        "Review Instrument Filter",
+        review_instruments,
+        default=review_instruments,
+        key="main_review_instrument_filter",
+    )
+
+    if selected_review_instruments:
+        review_df = review_df[
+            review_df["instrument"].isin(selected_review_instruments)
+        ].copy()
+
+    review_financial_years = sorted(
+        review_df["financial_year"].dropna().unique(),
+        reverse=True,
+    )
+
+    selected_review_financial_years = st.multiselect(
+        "Review Financial Year Filter",
+        review_financial_years,
+        default=review_financial_years,
+        key="main_review_financial_year_filter",
+    )
+
+    if selected_review_financial_years:
+        review_df = review_df[
+            review_df["financial_year"].isin(selected_review_financial_years)
+        ].copy()
+
+    sort_order = st.radio(
+        "Sort Order",
+        ["Latest First", "Oldest First"],
+        horizontal=True,
+        key="main_review_sort_order",
+    )
+
+    ascending_month = sort_order == "Oldest First"
+
+    review_df = review_df.sort_values(
         ["segment", "instrument", "month_date"],
-        ascending=[True, True, False],
+        ascending=[True, True, ascending_month],
+    ).copy()
+
+    st.caption(
+        f"Showing {len(review_df):,} clean monthly rows out of total {len(df):,} rows."
     )
 
     st.dataframe(
-        preview_df.head(500),
+        review_df,
         width="stretch",
         hide_index=True,
     )
