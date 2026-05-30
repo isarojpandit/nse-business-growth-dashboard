@@ -10,8 +10,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(PROJECT_ROOT))
 
 from dashboard.components.charts import (
-    TIME_RANGE_OPTIONS,
-    apply_time_range_filter,
     create_monthly_turnover_chart,
     create_monthly_volume_chart,
     create_mom_turnover_chart,
@@ -519,13 +517,6 @@ def render_sidebar_filters(df):
 
     st.sidebar.divider()
 
-    time_range = st.sidebar.selectbox(
-        "Time Range",
-        TIME_RANGE_OPTIONS,
-        index=2,
-        help="Default is Last 5 Years for better chart readability.",
-    )
-
     show_moving_average = st.sidebar.checkbox(
         "Show Moving Average",
         value=True,
@@ -565,18 +556,12 @@ def render_sidebar_filters(df):
             filtered_df["financial_quarter"].isin(selected_quarters)
         ].copy()
 
-    filtered_df = apply_time_range_filter(
-        filtered_df,
-        time_range,
-    )
-
     return {
         "selected_segment": selected_segment,
         "selected_instrument": selected_instrument,
         "selected_financial_years": selected_financial_years,
         "selected_months": selected_months,
         "selected_quarters": selected_quarters,
-        "time_range": time_range,
         "show_moving_average": show_moving_average,
         "ma_window": ma_window,
         "change_cap": change_cap,
@@ -591,6 +576,7 @@ def render_data_note():
             <b>Note:</b> Turnover is shown as average daily turnover in ₹ Crores.
             Volume for Capital Market is in Lakhs/day. Derivatives volume is in Contracts/day.
             MoM and QoQ charts are capped visually to avoid outlier distortion.
+            Charts include their own 1Y / 3Y / 5Y / 10Y / Full range controls.
         </div>
         """,
         unsafe_allow_html=True,
@@ -882,11 +868,6 @@ def render_comparative_tab(df, base_filters):
             )
         ].copy()
 
-    comparison_df = apply_time_range_filter(
-        comparison_df,
-        base_filters["time_range"],
-    )
-
     comparison_df["pair"] = (
         comparison_df["segment"].astype(str)
         + " — "
@@ -1077,7 +1058,7 @@ def main():
     selected_label = (
         f"{filter_state['selected_segment']} — "
         f"{filter_state['selected_instrument']} | "
-        f"{filter_state['time_range']}"
+        f"Full History"
     )
 
     st.markdown(f"### Current Selection: `{selected_label}`")

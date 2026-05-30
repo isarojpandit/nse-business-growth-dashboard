@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -33,31 +35,123 @@ jobs:
         run: |
           python -m playwright install chromium --with-deps
 
-      - name: Run monthly NSE data update
+      - name: Run optimized incremental NSE data update
         env:
-          PLAYWRIGHT_HEADLESS: "false"
+          GITHUB_ACTIONS: "true"
+          PLAYWRIGHT_HEADLESS: "true"
         run: |
-          xvfb-run -a python scripts/update_nse_monthly_data.py
+          xvfb-run -a python scripts/update_nse_monthly_incremental.py
 
-      - name: Load updated NSE data into SQLite
+      - name: Validate updated dataset
         run: |
-          python scripts/load_nse_history_to_db.py
+          python - <<'PY'
+          import sqlite3
+          import pandas as pd
+          from pathlib import Path
+
+          main_file = Path("data/processed/clean_nse_business_growth_from_nse.csv")
+          raw_file = Path("data/exports/final_raw_nse_daily_trading_days.csv")
+          db_file = Path("data/nse_business_growth.db")
+
+          if not main_file.exists():
+              raise FileNotFoundError(main_file)
+
+          if not raw_file.exists():
+              raise FileNotFoundError(raw_file)
+
+          if not db_file.exists():
+              raise FileNotFoundError(db_file)
+
+          main = pd.read_csv(main_file, keep_default_na=False)
+          raw = pd.read_csv(raw_file, keep_default_na=False)
+
+          main["instrument"] = main["instrument"].replace("", "NA")
+          raw["instrument"] = raw["instrument"].replace("", "NA")
+
+          print("MAIN ROWS:", len(main))
+          print(main.groupby(["segment", "instrument"], dropna=False).size())
+
+          print()
+          print("RAW ROWS:", len(raw))
+          print(raw.groupby(["segment", "instrument"], dropna=False).size())
+
+          main_keys = set(
+              zip(
+                  main["segment"].astype(str),
+                  main["instrument"].astype(str),
+                  main["month_label"].astype(str),
+              )
+          )
+
+          raw_keys = set(
+              zip(
+                  raw["segment"].astype(str),
+                  raw["instrument"].astype(str),
+                  raw["month_label"].astype(str),
+              )
+          )
+
+          extra_raw_keys = raw_keys - main_keys
+
+          if extra_raw_keys:
+              raise ValueError(
+                  f"Raw has month keys not present in main: {sorted(extra_raw_keys)[:20]}"
+              )
+
+          conn = sqlite3.connect(db_file)
+
+          db_count = pd.read_sql_query(
+              "SELECT COUNT(*) AS rows FROM nse_business_growth",
+              conn,
+          )
+
+          db_summary = pd.read_sql_query(
+              """
+              SELECT
+                  segment,
+                  instrument,
+                  COUNT(*) AS rows,
+                  MIN(month_date) AS start_month,
+                  MAX(month_date) AS end_month
+              FROM nse_business_growth
+              GROUP BY segment, instrument
+              ORDER BY segment, instrument
+              """,
+              conn,
+          )
+
+          conn.close()
+
+          print()
+          print("SQLITE ROWS:")
+          print(db_count.to_string(index=False))
+
+          print()
+          print(db_summary.to_string(index=False))
+
+          if int(db_count["rows"].iloc[0]) != len(main):
+              raise ValueError("SQLite row count does not match main CSV row count.")
+
+          print()
+          print("Validation successful.")
+          PY
 
       - name: Show updated files
         run: |
-          git status
+          git status --short
 
-      - name: Commit updated dataset and database
+      - name: Commit updated dataset, raw evidence, and database
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add data/processed/clean_nse_business_growth_from_nse.csv
+          git add data/exports/final_raw_nse_daily_trading_days.csv
           git add data/nse_business_growth.db
 
           if git diff --cached --quiet; then
-            echo "No data changes to commit."
+            echo "No complete new month found. No data changes to commit."
           else
-            git commit -m "Monthly NSE data update"
+            git commit -m "Monthly NSE incremental data update"
             git push
           fi

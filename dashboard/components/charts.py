@@ -2,15 +2,6 @@ import pandas as pd
 import plotly.graph_objects as go
 
 
-TIME_RANGE_OPTIONS = [
-    "Last 1 Year",
-    "Last 3 Years",
-    "Last 5 Years",
-    "Last 10 Years",
-    "Full History",
-]
-
-
 DEFAULT_CHART_HEIGHT = 520
 CHANGE_CHART_HEIGHT = 460
 COMPARATIVE_CHART_HEIGHT = 620
@@ -21,31 +12,6 @@ def prepare_month_date(df):
     df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
     df = df.dropna(subset=["month_date"])
     return df
-
-
-def apply_time_range_filter(df, time_range):
-    df = prepare_month_date(df)
-
-    if df.empty or time_range == "Full History":
-        return df
-
-    max_date = df["month_date"].max()
-
-    years_map = {
-        "Last 1 Year": 1,
-        "Last 3 Years": 3,
-        "Last 5 Years": 5,
-        "Last 10 Years": 10,
-    }
-
-    years = years_map.get(time_range)
-
-    if years is None:
-        return df
-
-    min_date = max_date - pd.DateOffset(years=years)
-
-    return df[df["month_date"] >= min_date].copy()
 
 
 def get_volume_axis_label(df):
