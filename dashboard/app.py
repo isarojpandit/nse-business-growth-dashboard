@@ -176,6 +176,19 @@ def inject_custom_css():
                 margin-top: 1rem;
                 margin-bottom: 1rem;
             }
+
+            div[data-testid="stPopover"] button {
+                border-radius: 8px;
+                border: 1px solid #cbd5e1;
+                background: white;
+                color: #0f172a;
+                font-weight: 600;
+            }
+
+            div[data-testid="stPopover"] button:hover {
+                border-color: #2563eb;
+                color: #2563eb;
+            }
         </style>
         """,
         unsafe_allow_html=True,
@@ -407,6 +420,113 @@ def get_volume_unit_text(segment):
     return "Contracts/day"
 
 
+def format_filter_label(label, selected, options):
+    if len(selected) == len(options):
+        return f"{label}: All"
+
+    if len(selected) == 0:
+        return f"{label}: None"
+
+    if len(selected) == 1:
+        return f"{label}: {selected[0]}"
+
+    return f"{label}: {len(selected)} selected"
+
+
+def excel_like_filter(label, options, key, default_all=True, sidebar=True):
+    options = [str(option) for option in options if pd.notna(option)]
+
+    selected_key = f"{key}_selected"
+    search_key = f"{key}_search"
+    version_key = f"{key}_version"
+
+    if version_key not in st.session_state:
+        st.session_state[version_key] = 0
+
+    if selected_key not in st.session_state:
+        st.session_state[selected_key] = options.copy() if default_all else []
+
+    current_valid_options = set(options)
+
+    st.session_state[selected_key] = [
+        item
+        for item in st.session_state[selected_key]
+        if item in current_valid_options
+    ]
+
+    if default_all and len(st.session_state[selected_key]) == 0 and options:
+        st.session_state[selected_key] = options.copy()
+
+    button_text = format_filter_label(
+        label,
+        st.session_state[selected_key],
+        options,
+    )
+
+    popover_parent = st.sidebar if sidebar else st
+
+    with popover_parent.popover(button_text, use_container_width=True):
+        search_text = st.text_input(
+            "Search",
+            key=search_key,
+            placeholder="Search",
+            label_visibility="collapsed",
+        )
+
+        filtered_options = [
+            option
+            for option in options
+            if search_text.lower() in option.lower()
+        ]
+
+        c1, c2 = st.columns(2)
+
+        with c1:
+            if st.button(
+                "Select All",
+                key=f"{key}_select_all",
+                use_container_width=True,
+            ):
+                st.session_state[selected_key] = options.copy()
+                st.session_state[version_key] += 1
+                st.rerun()
+
+        with c2:
+            if st.button(
+                "Clear",
+                key=f"{key}_clear",
+                use_container_width=True,
+            ):
+                st.session_state[selected_key] = []
+                st.session_state[version_key] += 1
+                st.rerun()
+
+        st.divider()
+
+        if not filtered_options:
+            st.caption("No matching values.")
+
+        version = st.session_state[version_key]
+
+        for option in filtered_options:
+            checked = option in st.session_state[selected_key]
+            checkbox_key = f"{key}_checkbox_{version}_{option}"
+
+            new_checked = st.checkbox(
+                option,
+                value=checked,
+                key=checkbox_key,
+            )
+
+            if new_checked and option not in st.session_state[selected_key]:
+                st.session_state[selected_key].append(option)
+
+            if not new_checked and option in st.session_state[selected_key]:
+                st.session_state[selected_key].remove(option)
+
+    return st.session_state[selected_key]
+
+
 def render_selected_kpis(filtered_df, selected_segment):
     if filtered_df.empty:
         return
@@ -483,36 +603,40 @@ def render_sidebar_filters(df):
         segment_df["instrument"] == selected_instrument
     ].copy()
 
-    years = sorted(
+    financial_years = sorted(
         instrument_df["financial_year"].dropna().unique(),
         reverse=True,
     )
 
-    selected_financial_years = st.sidebar.multiselect(
-        "Financial Year",
-        years,
-        default=years,
-        help="All available financial years are selected by default.",
+    selected_financial_years = excel_like_filter(
+        label="Financial Year",
+        options=financial_years,
+        key="sidebar_financial_year_filter",
+        default_all=True,
+        sidebar=True,
     )
 
-    available_months = sorted(
+    months = sorted(
         instrument_df["month_name"].dropna().unique(),
         key=lambda month: MONTH_ORDER.get(month, 99),
     )
 
-    selected_months = st.sidebar.multiselect(
-        "Month",
-        available_months,
-        default=available_months,
-        help="Select specific months if you want seasonal/month-wise analysis.",
+    selected_months = excel_like_filter(
+        label="Month",
+        options=months,
+        key="sidebar_month_filter",
+        default_all=True,
+        sidebar=True,
     )
 
     quarters = ["Q1", "Q2", "Q3", "Q4"]
 
-    selected_quarters = st.sidebar.multiselect(
-        "Financial Quarter",
-        quarters,
-        default=quarters,
+    selected_quarters = excel_like_filter(
+        label="Financial Quarter",
+        options=quarters,
+        key="sidebar_quarter_filter",
+        default_all=True,
+        sidebar=True,
     )
 
     st.sidebar.divider()
@@ -536,29 +660,33 @@ def render_sidebar_filters(df):
         help="Extreme percentage changes are capped visually. Tooltip still shows actual value.",
     )
 
-    filtered_df = df[
-        (df["segment"] == selected_segment)
-        & (df["instrument"] == selected_instrument)
-    ].copy()
+    filtered_df = instrument_df.copy()
 
     if selected_financial_years:
         filtered_df = filtered_df[
             filtered_df["financial_year"].isin(selected_financial_years)
         ].copy()
+    else:
+        filtered_df = filtered_df.iloc[0:0].copy()
 
     if selected_months:
         filtered_df = filtered_df[
             filtered_df["month_name"].isin(selected_months)
         ].copy()
+    else:
+        filtered_df = filtered_df.iloc[0:0].copy()
 
     if selected_quarters:
         filtered_df = filtered_df[
             filtered_df["financial_quarter"].isin(selected_quarters)
         ].copy()
+    else:
+        filtered_df = filtered_df.iloc[0:0].copy()
 
     return {
         "selected_segment": selected_segment,
         "selected_instrument": selected_instrument,
+        "selected_instruments": [selected_instrument],
         "selected_financial_years": selected_financial_years,
         "selected_months": selected_months,
         "selected_quarters": selected_quarters,
@@ -888,7 +1016,7 @@ def render_comparative_tab(df, base_filters):
         "Select segment/instrument pairs to compare",
         available_pairs,
         default=default_pairs,
-        help="Choose only the pairs you want to compare. Too many lines can make the chart crowded.",
+        help="Choose the segment/instrument pairs you want to compare.",
         key="comparative_selected_pairs",
     )
 
@@ -993,48 +1121,94 @@ def render_data_quality_tab(df):
 
     review_segments = sorted(review_df["segment"].dropna().unique())
 
-    selected_review_segments = st.multiselect(
-        "Review Segment Filter",
-        review_segments,
-        default=review_segments,
-        key="main_review_segment_filter",
+    selected_review_segments = excel_like_filter(
+        label="Review Segment",
+        options=review_segments,
+        key="quality_segment_filter",
+        default_all=True,
+        sidebar=False,
     )
 
     if selected_review_segments:
         review_df = review_df[
             review_df["segment"].isin(selected_review_segments)
         ].copy()
+    else:
+        review_df = review_df.iloc[0:0].copy()
 
     review_instruments = sorted(review_df["instrument"].dropna().unique())
 
-    selected_review_instruments = st.multiselect(
-        "Review Instrument Filter",
-        review_instruments,
-        default=review_instruments,
-        key="main_review_instrument_filter",
+    selected_review_instruments = excel_like_filter(
+        label="Review Instrument",
+        options=review_instruments,
+        key="quality_instrument_filter",
+        default_all=True,
+        sidebar=False,
     )
 
     if selected_review_instruments:
         review_df = review_df[
             review_df["instrument"].isin(selected_review_instruments)
         ].copy()
+    else:
+        review_df = review_df.iloc[0:0].copy()
 
     review_financial_years = sorted(
         review_df["financial_year"].dropna().unique(),
         reverse=True,
     )
 
-    selected_review_financial_years = st.multiselect(
-        "Review Financial Year Filter",
-        review_financial_years,
-        default=review_financial_years,
-        key="main_review_financial_year_filter",
+    selected_review_financial_years = excel_like_filter(
+        label="Review Financial Year",
+        options=review_financial_years,
+        key="quality_financial_year_filter",
+        default_all=True,
+        sidebar=False,
     )
 
     if selected_review_financial_years:
         review_df = review_df[
             review_df["financial_year"].isin(selected_review_financial_years)
         ].copy()
+    else:
+        review_df = review_df.iloc[0:0].copy()
+
+    review_months = sorted(
+        review_df["month_name"].dropna().unique(),
+        key=lambda month: MONTH_ORDER.get(month, 99),
+    )
+
+    selected_review_months = excel_like_filter(
+        label="Review Month",
+        options=review_months,
+        key="quality_month_filter",
+        default_all=True,
+        sidebar=False,
+    )
+
+    if selected_review_months:
+        review_df = review_df[
+            review_df["month_name"].isin(selected_review_months)
+        ].copy()
+    else:
+        review_df = review_df.iloc[0:0].copy()
+
+    review_quarters = ["Q1", "Q2", "Q3", "Q4"]
+
+    selected_review_quarters = excel_like_filter(
+        label="Review Quarter",
+        options=review_quarters,
+        key="quality_quarter_filter",
+        default_all=True,
+        sidebar=False,
+    )
+
+    if selected_review_quarters:
+        review_df = review_df[
+            review_df["financial_quarter"].isin(selected_review_quarters)
+        ].copy()
+    else:
+        review_df = review_df.iloc[0:0].copy()
 
     sort_order = st.radio(
         "Sort Order",
