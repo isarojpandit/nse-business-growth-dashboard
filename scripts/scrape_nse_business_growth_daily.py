@@ -1,5 +1,6 @@
 from pathlib import Path
 from datetime import datetime
+import os
 import re
 
 import pandas as pd
@@ -13,6 +14,8 @@ MAIN_OUTPUT_FILE = EXPORT_DIR / "test_clean_nse_business_growth_from_daily.csv"
 RAW_OUTPUT_FILE = EXPORT_DIR / "raw_nse_daily_trading_days.csv"
 
 MAX_YEARS_PER_SEGMENT = None
+SCRAPE_ONLY_AFTER_MONTH_DATE = None
+SCRAPE_ONLY_BEFORE_MONTH_DATE = None
 
 NSE_SEGMENT_URLS = {
     "capital_market": {
@@ -41,6 +44,10 @@ EXPECTED_SEGMENT_INSTRUMENT_GROUPS = {
     ("Currency Derivatives", "Options"),
     ("Interest Rate Derivatives", "NA"),
 }
+
+
+class NSEConnectionError(RuntimeError):
+    pass
 
 
 def clean_number(value):
@@ -144,6 +151,27 @@ def month_label_to_date(month_label):
     return pd.to_datetime(month_label, format="%b-%Y", errors="coerce")
 
 
+def is_month_allowed_for_incremental(month_label):
+    month_date = month_label_to_date(month_label)
+
+    if pd.isna(month_date):
+        return True
+
+    if SCRAPE_ONLY_AFTER_MONTH_DATE is not None:
+        after_date = pd.to_datetime(SCRAPE_ONLY_AFTER_MONTH_DATE)
+
+        if month_date <= after_date:
+            return False
+
+    if SCRAPE_ONLY_BEFORE_MONTH_DATE is not None:
+        before_date = pd.to_datetime(SCRAPE_ONLY_BEFORE_MONTH_DATE)
+
+        if month_date >= before_date:
+            return False
+
+    return True
+
+
 def get_financial_year(month_date):
     if pd.isna(month_date):
         return None
@@ -165,13 +193,10 @@ def get_financial_quarter(month_date):
 
     if month in [4, 5, 6]:
         return "Q1"
-
     if month in [7, 8, 9]:
         return "Q2"
-
     if month in [10, 11, 12]:
         return "Q3"
-
     if month in [1, 2, 3]:
         return "Q4"
 
@@ -202,106 +227,49 @@ def load_existing_outputs():
     return main_df, raw_df
 
 
-def dataframe_to_source_main_rows(main_df):
+def get_existing_main_keys(main_df):
     if main_df.empty:
-        return []
-
-    needed_columns = [
-        "segment",
-        "instrument",
-        "month_label",
-        "monthly_turnover",
-        "monthly_volume",
-        "active_trading_days",
-        "turnover",
-        "volume",
-        "source_logic",
-    ]
-
-    available_columns = [column for column in needed_columns if column in main_df.columns]
-
-    return main_df[available_columns].to_dict("records")
-
-
-def dataframe_to_raw_rows(raw_df):
-    if raw_df.empty:
-        return []
-
-    return raw_df.to_dict("records")
-
-
-def get_existing_main_keys(main_rows):
-    if not main_rows:
         return set()
-
-    df = pd.DataFrame(main_rows)
 
     required_columns = {"segment", "instrument", "month_label"}
 
-    if not required_columns.issubset(df.columns):
+    if not required_columns.issubset(set(main_df.columns)):
         return set()
 
     return set(
         zip(
-            df["segment"].astype(str),
-            df["instrument"].astype(str),
-            df["month_label"].astype(str),
+            main_df["segment"].astype(str),
+            main_df["instrument"].astype(str),
+            main_df["month_label"].astype(str),
         )
     )
 
 
-def get_existing_raw_keys(raw_rows):
-    if not raw_rows:
-        return set()
+def warm_up_nse(page):
+    warmup_urls = [
+        "https://www.nseindia.com/",
+        "https://www.nseindia.com/market-data",
+    ]
 
-    df = pd.DataFrame(raw_rows)
+    for warmup_url in warmup_urls:
+        try:
+            print(f"Warming up NSE session: {warmup_url}")
 
-    required_columns = {
-        "segment",
-        "instrument",
-        "month_label",
-        "clicked_year",
-        "source_level",
-        "date",
-    }
+            page.goto(
+                warmup_url,
+                wait_until="domcontentloaded",
+                timeout=90000,
+            )
 
-    if not required_columns.issubset(df.columns):
-        return set()
+            try:
+                page.wait_for_load_state("networkidle", timeout=30000)
+            except Exception as network_error:
+                print(f"Warmup network idle wait skipped: {network_error}")
 
-    return set(
-        zip(
-            df["segment"].astype(str),
-            df["instrument"].astype(str),
-            df["month_label"].astype(str),
-            df["clicked_year"].astype(str),
-            df["source_level"].astype(str),
-            df["date"].astype(str),
-        )
-    )
+            page.wait_for_timeout(5000)
 
-
-def get_existing_missing_daily_keys(raw_rows):
-    if not raw_rows:
-        return set()
-
-    df = pd.DataFrame(raw_rows)
-
-    required_columns = {"segment", "month_label", "source_level"}
-
-    if not required_columns.issubset(df.columns):
-        return set()
-
-    missing_df = df[df["source_level"].astype(str) == "missing_daily_table"].copy()
-
-    if missing_df.empty:
-        return set()
-
-    return set(
-        zip(
-            missing_df["segment"].astype(str),
-            missing_df["month_label"].astype(str),
-        )
-    )
+        except Exception as error:
+            print(f"NSE warmup failed but continuing: {warmup_url} | {error}")
 
 
 def open_segment_page(page, url, retries=5):
@@ -311,16 +279,36 @@ def open_segment_page(page, url, retries=5):
         try:
             print(f"Opening page attempt {attempt}/{retries}: {url}")
 
+            if attempt == 1:
+                warm_up_nse(page)
+
             page.goto(
                 url,
                 wait_until="domcontentloaded",
-                timeout=90000,
+                timeout=120000,
             )
 
-            page.wait_for_timeout(12000)
-            page.mouse.wheel(0, 900)
-            page.wait_for_timeout(2500)
+            try:
+                page.wait_for_load_state("networkidle", timeout=60000)
+            except Exception as network_error:
+                print(f"Network idle wait skipped: {network_error}")
 
+            page.wait_for_timeout(12000)
+
+            body_text = page.locator("body").inner_text(timeout=30000)
+
+            if "Access Denied" in body_text or "Forbidden" in body_text:
+                raise RuntimeError("NSE returned Access Denied / Forbidden page.")
+
+            if len(body_text.strip()) < 500:
+                raise RuntimeError(
+                    "NSE page body is too small. Page may not have loaded correctly."
+                )
+
+            page.mouse.wheel(0, 900)
+            page.wait_for_timeout(3000)
+
+            print("Page opened successfully.")
             return True
 
         except Exception as error:
@@ -328,16 +316,48 @@ def open_segment_page(page, url, retries=5):
             print(f"Page open failed attempt {attempt}/{retries}: {error}")
 
             try:
-                page.wait_for_timeout(5000)
-                page.reload(wait_until="domcontentloaded", timeout=90000)
-                page.wait_for_timeout(5000)
-                page.mouse.wheel(0, 900)
-                page.wait_for_timeout(2500)
-                return True
-            except Exception as reload_error:
-                print(f"Reload also failed: {reload_error}")
+                page.wait_for_timeout(6000)
 
-            page.wait_for_timeout(8000)
+                page.goto(
+                    "https://www.nseindia.com/",
+                    wait_until="domcontentloaded",
+                    timeout=90000,
+                )
+
+                page.wait_for_timeout(5000)
+
+                page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=120000,
+                )
+
+                try:
+                    page.wait_for_load_state("networkidle", timeout=60000)
+                except Exception as network_error:
+                    print(f"Network idle wait skipped after retry: {network_error}")
+
+                page.wait_for_timeout(8000)
+                page.mouse.wheel(0, 900)
+                page.wait_for_timeout(3000)
+
+                body_text = page.locator("body").inner_text(timeout=30000)
+
+                if "Access Denied" in body_text or "Forbidden" in body_text:
+                    raise RuntimeError(
+                        "NSE returned Access Denied / Forbidden page after retry."
+                    )
+
+                if len(body_text.strip()) < 500:
+                    raise RuntimeError("Reloaded NSE page body is too small.")
+
+                print("Page opened successfully after NSE home retry.")
+                return True
+
+            except Exception as retry_error:
+                print(f"NSE home retry also failed: {retry_error}")
+
+            page.wait_for_timeout(10000)
 
     print(f"Failed to open page after {retries} attempts: {url}")
     print(f"Last error: {last_error}")
@@ -393,9 +413,7 @@ def click_month_from_summary_table(page, month_label, retries=3):
         print(f"    Month click attempt {attempt}/{retries}: {month_label}")
 
         for value in month_variants:
-            cell_locator = page.locator(
-                "table tr td, table tr th"
-            ).filter(
+            cell_locator = page.locator("table tr td, table tr th").filter(
                 has_text=re.compile(
                     rf"^\s*{re.escape(value)}\s*$",
                     re.IGNORECASE,
@@ -447,6 +465,28 @@ def click_month_from_summary_table(page, month_label, retries=3):
 
                 except Exception as error:
                     print(f"    Month row click failed: {value} index {index}: {error}")
+
+        for value in month_variants:
+            table_text_locator = page.locator("table").get_by_text(
+                re.compile(re.escape(value), re.IGNORECASE)
+            )
+
+            count = table_text_locator.count()
+            print(f"    Month table text '{value}' count: {count}")
+
+            for index in range(count):
+                item = table_text_locator.nth(index)
+
+                try:
+                    if item.is_visible():
+                        item.scroll_into_view_if_needed()
+                        page.wait_for_timeout(500)
+                        item.click(timeout=15000)
+                        page.wait_for_timeout(7000)
+                        return True
+
+                except Exception as error:
+                    print(f"    Month table text click failed: {value} index {index}: {error}")
 
         page.wait_for_timeout(3000)
 
@@ -557,42 +597,6 @@ def get_months_from_summary_table(summary_table):
     )
 
     return months
-
-
-def restore_year_summary_page(page, url, year):
-    print(f"  Restoring year summary page: {year}")
-
-    opened = open_segment_page(page, url)
-
-    if not opened:
-        return False
-
-    clicked = click_text(page, year)
-
-    if not clicked:
-        return False
-
-    return True
-
-
-def back_to_year_summary_or_restore(page, url, year):
-    try:
-        page.go_back(wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(5000)
-
-        current_tables = extract_tables(page)
-        current_summary = find_month_summary_table(current_tables)
-        current_months = get_months_from_summary_table(current_summary)
-
-        if current_months:
-            return True
-
-        print("  Back page does not contain month summary. Restoring...")
-        return restore_year_summary_page(page, url, year)
-
-    except Exception as error:
-        print(f"  Back navigation failed: {error}")
-        return restore_year_summary_page(page, url, year)
 
 
 def extract_daily_rows_from_tables(all_tables):
@@ -723,22 +727,6 @@ def make_raw_row(
     return row
 
 
-def make_missing_daily_marker(source_name, segment, clicked_year, month_label, reason):
-    return {
-        "source_name": source_name,
-        "segment": segment,
-        "instrument": "NA",
-        "clicked_year": clicked_year,
-        "month_label": month_label,
-        "date": "",
-        "daily_turnover": "",
-        "daily_volume": "",
-        "active_trading_days": "",
-        "source_level": "missing_daily_table",
-        "raw_col_1": reason,
-    }
-
-
 def normalize_capital_market_year(summary_table, clicked_year):
     main_rows = []
     raw_rows = []
@@ -753,6 +741,10 @@ def normalize_capital_market_year(summary_table, clicked_year):
         month_label = normalize_month_label(raw_row[0])
 
         if month_label is None:
+            continue
+
+        if not is_month_allowed_for_incremental(month_label):
+            print(f"  Skipping month by cutoff: Capital Market | {month_label}")
             continue
 
         trading_days = clean_number(raw_row[4])
@@ -926,6 +918,7 @@ def aggregate_equity_derivatives(month_label, daily_df):
     if daily_df.empty:
         return rows
 
+    daily_df = daily_df.copy()
     active_days = daily_df["date"].nunique()
 
     if active_days == 0:
@@ -974,6 +967,7 @@ def aggregate_currency_derivatives(month_label, daily_df):
     if daily_df.empty:
         return rows
 
+    daily_df = daily_df.copy()
     active_days = daily_df["date"].nunique()
 
     if active_days == 0:
@@ -1022,6 +1016,7 @@ def aggregate_interest_rate_derivatives(month_label, daily_df):
     if daily_df.empty:
         return rows
 
+    daily_df = daily_df.copy()
     active_days = daily_df["date"].nunique()
 
     if active_days == 0:
@@ -1224,9 +1219,36 @@ def save_progress(main_rows, raw_rows, final_save=False):
     return main_df, raw_df
 
 
+def dataframe_to_source_main_rows(main_df):
+    if main_df.empty:
+        return []
+
+    needed_columns = [
+        "segment",
+        "instrument",
+        "month_label",
+        "monthly_turnover",
+        "monthly_volume",
+        "active_trading_days",
+        "turnover",
+        "volume",
+        "source_logic",
+    ]
+
+    available_columns = [column for column in needed_columns if column in main_df.columns]
+
+    return main_df[available_columns].to_dict("records")
+
+
+def dataframe_to_raw_rows(raw_df):
+    if raw_df.empty:
+        return []
+
+    return raw_df.to_dict("records")
+
+
 def scrape_capital_market(page, source_name, segment_name, url, years, main_rows, raw_rows):
-    existing_main_keys = get_existing_main_keys(main_rows)
-    existing_raw_keys = get_existing_raw_keys(raw_rows)
+    existing_keys = get_existing_main_keys(pd.DataFrame(main_rows))
 
     for year in years:
         print(f"\nCapital Market | Year: {year}")
@@ -1236,7 +1258,7 @@ def scrape_capital_market(page, source_name, segment_name, url, years, main_rows
         if not opened:
             print("NSE page failed repeatedly. Saving progress and stopping safely.")
             save_progress(main_rows, raw_rows, final_save=False)
-            raise RuntimeError(
+            raise NSEConnectionError(
                 f"NSE connection failed repeatedly for Capital Market | {year}. "
                 "Progress is saved. Wait 5-10 minutes and run again."
             )
@@ -1256,30 +1278,32 @@ def scrape_capital_market(page, source_name, segment_name, url, years, main_rows
         )
 
         added = 0
+        allowed_raw_keys = set()
 
         for row in year_main_rows:
             key = (row["segment"], row["instrument"], row["month_label"])
 
-            if key not in existing_main_keys:
-                main_rows.append(row)
-                existing_main_keys.add(key)
-                added += 1
+            if key in existing_keys:
+                print(f"  Skipping already scraped: {key}")
+                continue
+
+            main_rows.append(row)
+            existing_keys.add(key)
+            allowed_raw_keys.add(key)
+            added += 1
 
         for raw_row in year_raw_rows:
             raw_key = (
-                str(raw_row.get("segment")),
-                str(raw_row.get("instrument")),
-                str(raw_row.get("month_label")),
-                str(raw_row.get("clicked_year")),
-                str(raw_row.get("source_level")),
-                str(raw_row.get("date")),
+                raw_row["segment"],
+                raw_row["instrument"],
+                raw_row["month_label"],
             )
 
-            if raw_key not in existing_raw_keys:
+            if raw_key in allowed_raw_keys:
                 raw_rows.append(raw_row)
-                existing_raw_keys.add(raw_key)
 
         print(f"Capital Market rows added: {added}")
+
         save_progress(main_rows, raw_rows, final_save=False)
 
     return main_rows, raw_rows
@@ -1294,7 +1318,7 @@ def scrape_derivative_segment(page, source_name, segment_name, url, years, main_
         if not opened:
             print("NSE page failed repeatedly. Saving progress and stopping safely.")
             save_progress(main_rows, raw_rows, final_save=False)
-            raise RuntimeError(
+            raise NSEConnectionError(
                 f"NSE connection failed repeatedly for {segment_name} | {year}. "
                 "Progress is saved. Wait 5-10 minutes and run again."
             )
@@ -1312,12 +1336,11 @@ def scrape_derivative_segment(page, source_name, segment_name, url, years, main_
         print(f"Months found: {months}")
 
         for month_label in months:
-            existing_keys = get_existing_main_keys(main_rows)
-            missing_daily_keys = get_existing_missing_daily_keys(raw_rows)
-
-            if (segment_name, month_label) in missing_daily_keys:
-                print(f"  Skipping known missing daily table: {segment_name} | {month_label}")
+            if not is_month_allowed_for_incremental(month_label):
+                print(f"  Skipping month by cutoff: {segment_name} | {month_label}")
                 continue
+
+            existing_keys = get_existing_main_keys(pd.DataFrame(main_rows))
 
             if source_name in ["equity_derivatives", "currency_derivatives"]:
                 futures_key = (segment_name, "Futures", month_label)
@@ -1336,35 +1359,28 @@ def scrape_derivative_segment(page, source_name, segment_name, url, years, main_
 
             print(f"  Processing month: {month_label}")
 
+            opened = open_segment_page(page, url)
+
+            if not opened:
+                print("NSE page failed repeatedly. Saving progress and stopping safely.")
+                save_progress(main_rows, raw_rows, final_save=False)
+                raise NSEConnectionError(
+                    f"NSE connection failed repeatedly for {segment_name} | {year} | {month_label}. "
+                    "Progress is saved. Wait 5-10 minutes and run again."
+                )
+
+            clicked_year = click_text(page, year)
+
+            if not clicked_year:
+                print(f"  Could not click year again: {year}")
+                continue
+
             clicked_month = click_month_from_summary_table(page, month_label)
 
             if not clicked_month:
-                print(f"  Could not click month from current year table: {month_label}")
-                print("  Marking this month as missing_daily_table and continuing.")
-
-                raw_rows.append(
-                    make_missing_daily_marker(
-                        source_name=source_name,
-                        segment=segment_name,
-                        clicked_year=year,
-                        month_label=month_label,
-                        reason="Month click failed from year summary table",
-                    )
-                )
-
+                print(f"  Could not click month from summary table: {month_label}")
+                print("  Saving progress and continuing to next month.")
                 save_progress(main_rows, raw_rows, final_save=False)
-
-                restored = restore_year_summary_page(page, url, year)
-
-                if not restored:
-                    print("  Could not restore year page after month click failure.")
-                    print("  Progress is saved. Stop safely; run again later.")
-                    raise RuntimeError(
-                        f"NSE connection failed while restoring after month click failure: "
-                        f"{segment_name} | {year} | {month_label}. "
-                        "Progress is saved. Run again."
-                    )
-
                 continue
 
             all_month_tables = extract_tables(page)
@@ -1372,31 +1388,6 @@ def scrape_derivative_segment(page, source_name, segment_name, url, years, main_
 
             if not daily_rows:
                 print(f"  No daily rows found for {month_label}")
-                print("  Marking this month as missing_daily_table and moving ahead.")
-
-                raw_rows.append(
-                    make_missing_daily_marker(
-                        source_name=source_name,
-                        segment=segment_name,
-                        clicked_year=year,
-                        month_label=month_label,
-                        reason="No daily date rows found after clicking month",
-                    )
-                )
-
-                save_progress(main_rows, raw_rows, final_save=False)
-
-                restored = back_to_year_summary_or_restore(page, url, year)
-
-                if not restored:
-                    print("  Could not restore year page after missing daily rows.")
-                    print("  Progress is saved. Stop safely; run again later.")
-                    raise RuntimeError(
-                        f"NSE connection failed while restoring after missing daily table: "
-                        f"{segment_name} | {year} | {month_label}. "
-                        "Progress is saved. Run again."
-                    )
-
                 continue
 
             daily_df = get_daily_dataframe(
@@ -1409,31 +1400,6 @@ def scrape_derivative_segment(page, source_name, segment_name, url, years, main_
 
             if daily_df.empty:
                 print(f"  Daily dataframe empty for {month_label}")
-                print("  Marking this month as missing_daily_table and moving ahead.")
-
-                raw_rows.append(
-                    make_missing_daily_marker(
-                        source_name=source_name,
-                        segment=segment_name,
-                        clicked_year=year,
-                        month_label=month_label,
-                        reason="Daily dataframe empty after extracting daily rows",
-                    )
-                )
-
-                save_progress(main_rows, raw_rows, final_save=False)
-
-                restored = back_to_year_summary_or_restore(page, url, year)
-
-                if not restored:
-                    print("  Could not restore year page after empty dataframe.")
-                    print("  Progress is saved. Stop safely; run again later.")
-                    raise RuntimeError(
-                        f"NSE connection failed while restoring after empty dataframe: "
-                        f"{segment_name} | {year} | {month_label}. "
-                        "Progress is saved. Run again."
-                    )
-
                 continue
 
             print(
@@ -1463,16 +1429,6 @@ def scrape_derivative_segment(page, source_name, segment_name, url, years, main_
 
             save_progress(main_rows, raw_rows, final_save=False)
 
-            restored = back_to_year_summary_or_restore(page, url, year)
-
-            if not restored:
-                print("NSE page failed repeatedly. Saving progress and stopping safely.")
-                save_progress(main_rows, raw_rows, final_save=False)
-                raise RuntimeError(
-                    f"NSE connection failed after scraping {segment_name} | {year} | {month_label}. "
-                    "Progress is saved. Wait 5-10 minutes and run again."
-                )
-
     return main_rows, raw_rows
 
 
@@ -1482,78 +1438,133 @@ def scrape_all_segments():
     main_rows = dataframe_to_source_main_rows(existing_main_df)
     raw_rows = dataframe_to_raw_rows(existing_raw_df)
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=False,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--start-maximized",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
+    try:
+        with sync_playwright() as p:
+            headless_value = os.getenv("PLAYWRIGHT_HEADLESS", "false").lower()
+            headless = headless_value in ["1", "true", "yes"]
 
-        context = browser.new_context(
-            viewport={"width": 1600, "height": 1000},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-            ignore_https_errors=True,
-        )
+            print(f"Playwright headless mode: {headless}")
 
-        page = context.new_page()
+            browser = p.chromium.launch(
+                headless=headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-http2",
+                    "--disable-quic",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                    "--disable-background-networking",
+                    "--disable-default-apps",
+                    "--disable-sync",
+                    "--disable-translate",
+                    "--hide-scrollbars",
+                    "--metrics-recording-only",
+                    "--mute-audio",
+                    "--no-first-run",
+                    "--safebrowsing-disable-auto-update",
+                    "--window-size=1920,1080",
+                ],
+            )
 
-        for source_name, config in NSE_SEGMENT_URLS.items():
-            segment_name = config["segment"]
-            url = config["url"]
+            context = browser.new_context(
+                viewport={"width": 1920, "height": 1080},
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/125.0.0.0 Safari/537.36"
+                ),
+                locale="en-IN",
+                timezone_id="Asia/Kolkata",
+                ignore_https_errors=True,
+                extra_http_headers={
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                        "image/avif,image/webp,image/apng,*/*;q=0.8"
+                    ),
+                    "Accept-Language": "en-IN,en;q=0.9,hi-IN;q=0.8,hi;q=0.7",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache",
+                    "Referer": "https://www.nseindia.com/",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+            )
 
-            print("\n" + "=" * 120)
-            print(f"SCRAPING SEGMENT: {segment_name}")
-            print("=" * 120)
+            context.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
 
-            opened = open_segment_page(page, url)
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5]
+                });
 
-            if not opened:
-                print("NSE page failed repeatedly. Saving progress and stopping safely.")
-                save_progress(main_rows, raw_rows, final_save=False)
-                raise RuntimeError(
-                    f"NSE connection failed repeatedly for segment: {segment_name}. "
-                    "Progress is saved. Wait 5-10 minutes and run again."
-                )
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-IN', 'en', 'hi-IN', 'hi']
+                });
+                """
+            )
 
-            years = get_available_financial_years(page)
+            page = context.new_page()
 
-            if MAX_YEARS_PER_SEGMENT is not None:
-                years = years[:MAX_YEARS_PER_SEGMENT]
+            for source_name, config in NSE_SEGMENT_URLS.items():
+                segment_name = config["segment"]
+                url = config["url"]
 
-            print(f"Years selected: {years}")
+                print("\n" + "=" * 120)
+                print(f"SCRAPING SEGMENT: {segment_name}")
+                print("=" * 120)
 
-            if source_name == "capital_market":
-                main_rows, raw_rows = scrape_capital_market(
-                    page=page,
-                    source_name=source_name,
-                    segment_name=segment_name,
-                    url=url,
-                    years=years,
-                    main_rows=main_rows,
-                    raw_rows=raw_rows,
-                )
+                opened = open_segment_page(page, url)
 
-            else:
-                main_rows, raw_rows = scrape_derivative_segment(
-                    page=page,
-                    source_name=source_name,
-                    segment_name=segment_name,
-                    url=url,
-                    years=years,
-                    main_rows=main_rows,
-                    raw_rows=raw_rows,
-                )
+                if not opened:
+                    print("NSE page failed repeatedly. Saving progress and stopping safely.")
+                    save_progress(main_rows, raw_rows, final_save=False)
+                    raise NSEConnectionError(
+                        f"NSE connection failed repeatedly for segment: {segment_name}. "
+                        "Progress is saved. Wait 5-10 minutes and run again."
+                    )
 
-        browser.close()
+                years = get_available_financial_years(page)
+
+                if MAX_YEARS_PER_SEGMENT is not None:
+                    years = years[:MAX_YEARS_PER_SEGMENT]
+
+                print(f"Years selected: {years}")
+
+                if source_name == "capital_market":
+                    main_rows, raw_rows = scrape_capital_market(
+                        page=page,
+                        source_name=source_name,
+                        segment_name=segment_name,
+                        url=url,
+                        years=years,
+                        main_rows=main_rows,
+                        raw_rows=raw_rows,
+                    )
+
+                else:
+                    main_rows, raw_rows = scrape_derivative_segment(
+                        page=page,
+                        source_name=source_name,
+                        segment_name=segment_name,
+                        url=url,
+                        years=years,
+                        main_rows=main_rows,
+                        raw_rows=raw_rows,
+                    )
+
+            browser.close()
+
+    except NSEConnectionError as error:
+        print("\n" + "=" * 120)
+        print("STOPPED SAFELY DUE TO NSE CONNECTION ERROR")
+        print(error)
+        print("Run the same command again after 5-10 minutes. Existing rows will be skipped.")
+        save_progress(main_rows, raw_rows, final_save=False)
+        return None, None
 
     final_main_df, final_raw_df = save_progress(main_rows, raw_rows, final_save=True)
 

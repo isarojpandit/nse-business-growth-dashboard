@@ -1,41 +1,29 @@
-import os
-from pathlib import Path
 import sqlite3
+import sys
+from pathlib import Path
+from datetime import datetime
+
 import pandas as pd
 
-from scrape_nse_business_growth_daily import (
-    NSE_SEGMENT_URLS,
-    open_segment_page,
-    click_text,
-    click_month_from_summary_table,
-    extract_tables,
-    find_month_summary_table,
-    get_months_from_summary_table,
-    normalize_capital_market_year,
-    extract_daily_rows_from_tables,
-    get_daily_dataframe,
-    aggregate_equity_derivatives,
-    aggregate_currency_derivatives,
-    aggregate_interest_rate_derivatives,
-    build_equity_raw_rows,
-    build_currency_raw_rows,
-    build_ird_raw_rows,
-    add_dashboard_fields,
-    remove_incomplete_latest_month,
-    get_available_financial_years,
-)
 
-from playwright.sync_api import sync_playwright
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.append(str(PROJECT_ROOT))
+
+from scripts import scrape_nse_business_growth_daily as scraper
 
 
-MAIN_FILE = Path("data/processed/clean_nse_business_growth_from_nse.csv")
-RAW_FILE = Path("data/exports/final_raw_nse_daily_trading_days.csv")
+PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+EXPORT_DIR = PROJECT_ROOT / "data" / "exports"
+BACKUP_DIR = PROJECT_ROOT / "data" / "backups"
+DB_PATH = PROJECT_ROOT / "data" / "nse_business_growth.db"
 
-BACKUP_DIR = Path("data/backups")
+MAIN_DATASET_PATH = PROCESSED_DIR / "clean_nse_business_growth_from_nse.csv"
+RAW_EVIDENCE_PATH = EXPORT_DIR / "final_raw_nse_daily_trading_days.csv"
 
-DB_FILE = Path("data/nse_business_growth.db")
-TABLE_NAME = "nse_business_growth"
+TEMP_MAIN_PATH = EXPORT_DIR / "incremental_candidate_main.csv"
+TEMP_RAW_PATH = EXPORT_DIR / "incremental_candidate_raw.csv"
 
+DB_TABLE_NAME = "nse_business_growth"
 
 EXPECTED_GROUPS = {
     ("Capital Market", "NA"),
@@ -46,465 +34,359 @@ EXPECTED_GROUPS = {
     ("Interest Rate Derivatives", "NA"),
 }
 
+MAIN_COLUMNS = [
+    "segment",
+    "instrument",
+    "year",
+    "month_label",
+    "month_date",
+    "calendar_quarter",
+    "financial_year",
+    "financial_quarter",
+    "turnover",
+    "volume",
+    "mom_turnover_change",
+    "mom_volume_change",
+]
 
-def read_main_data():
-    if not MAIN_FILE.exists():
-        raise FileNotFoundError(f"Main CSV not found: {MAIN_FILE}")
-
-    df = pd.read_csv(MAIN_FILE, keep_default_na=False)
-
-    df["segment"] = df["segment"].astype(str).str.strip()
-    df["instrument"] = df["instrument"].replace("", "NA").astype(str).str.strip()
-    df["month_label"] = df["month_label"].astype(str).str.strip()
-    df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
-
-    df = df.dropna(subset=["month_date"]).copy()
-
-    return df
-
-
-def read_raw_data():
-    if not RAW_FILE.exists():
-        print(f"Raw file not found, creating new raw dataframe: {RAW_FILE}")
-        return pd.DataFrame()
-
-    df = pd.read_csv(RAW_FILE, keep_default_na=False)
-
-    if "segment" in df.columns:
-        df["segment"] = df["segment"].astype(str).str.strip()
-
-    if "instrument" in df.columns:
-        df["instrument"] = df["instrument"].replace("", "NA").astype(str).str.strip()
-
-    if "month_label" in df.columns:
-        df["month_label"] = df["month_label"].astype(str).str.strip()
-
-    return df
+RAW_REQUIRED_COLUMNS = [
+    "segment",
+    "instrument",
+    "month_label",
+]
 
 
-def backup_current_files():
-    if os.getenv("GITHUB_ACTIONS") == "true":
-        print("Running in GitHub Actions. Skipping backup file creation.")
-        return
+class IncrementalUpdateError(RuntimeError):
+    pass
 
+
+def ensure_directories():
+    PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
+    EXPORT_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
-    timestamp = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
 
-    if MAIN_FILE.exists():
-        backup_main = BACKUP_DIR / f"clean_nse_business_growth_from_nse_{timestamp}.csv"
+def read_csv_safely(path):
+    if not path.exists():
+        return pd.DataFrame()
 
-        pd.read_csv(MAIN_FILE, keep_default_na=False).to_csv(
-            backup_main,
-            index=False,
-            encoding="utf-8-sig",
-        )
-
-        print(f"Main backup created: {backup_main}")
-
-    if RAW_FILE.exists():
-        backup_raw = BACKUP_DIR / f"final_raw_nse_daily_trading_days_{timestamp}.csv"
-
-        pd.read_csv(RAW_FILE, keep_default_na=False).to_csv(
-            backup_raw,
-            index=False,
-            encoding="utf-8-sig",
-        )
-
-        print(f"Raw backup created: {backup_raw}")
+    return pd.read_csv(path, keep_default_na=False)
 
 
-def month_label_to_date(month_label):
-    return pd.to_datetime(month_label, format="%b-%Y", errors="coerce")
+def normalize_instrument(value):
+    if pd.isna(value):
+        return "NA"
+
+    text = str(value).strip()
+
+    if text == "" or text.lower() == "nan":
+        return "NA"
+
+    return text
 
 
-def get_latest_complete_month(main_df):
-    df = main_df.copy()
+def normalize_main_df(df):
+    if df.empty:
+        return pd.DataFrame(columns=MAIN_COLUMNS)
 
-    df["segment"] = df["segment"].astype(str)
-    df["instrument"] = df["instrument"].replace("", "NA").astype(str)
-    df["month_label"] = df["month_label"].astype(str)
+    df = df.copy()
 
-    grouped = (
-        df.groupby("month_label")
-        .apply(
-            lambda x: set(
-                zip(
-                    x["segment"].astype(str),
-                    x["instrument"].astype(str),
-                )
-            )
-        )
-        .reset_index(name="groups")
-    )
+    for column in MAIN_COLUMNS:
+        if column not in df.columns:
+            df[column] = pd.NA
 
-    complete_months = []
+    df = df[MAIN_COLUMNS].copy()
 
-    for _, row in grouped.iterrows():
-        if EXPECTED_GROUPS.issubset(row["groups"]):
-            complete_months.append(row["month_label"])
+    df["segment"] = df["segment"].astype(str).str.strip()
+    df["instrument"] = df["instrument"].apply(normalize_instrument)
+    df["month_label"] = df["month_label"].astype(str).str.strip()
 
-    if not complete_months:
-        raise ValueError("No complete month found in existing main CSV.")
+    df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
+    df = df.dropna(subset=["month_date"])
 
-    complete_month_dates = [
-        month_label_to_date(month_label)
-        for month_label in complete_months
+    df["month_label"] = df["month_date"].dt.strftime("%b-%Y")
+    df["year"] = df["month_date"].dt.year.astype("Int64")
+
+    numeric_columns = [
+        "turnover",
+        "volume",
+        "mom_turnover_change",
+        "mom_volume_change",
     ]
 
-    latest_date = max(complete_month_dates)
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
 
-    return latest_date
-
-
-def get_candidate_years_from_latest(latest_complete_month):
-    current_date = pd.Timestamp.today()
-
-    candidate_years = set()
-
-    start_year = latest_complete_month.year
-    end_year = current_date.year + 1
-
-    for year in range(start_year - 1, end_year + 1):
-        candidate_years.add(f"{year}-{year + 1}")
-
-    return candidate_years
-
-
-def find_new_months_from_summary(summary_table, latest_complete_month):
-    months = get_months_from_summary_table(summary_table)
-
-    new_months = []
-
-    for month_label in months:
-        month_date = month_label_to_date(month_label)
-
-        if pd.isna(month_date):
-            continue
-
-        if month_date > latest_complete_month:
-            new_months.append(month_label)
-
-    new_months = sorted(
-        set(new_months),
-        key=lambda value: month_label_to_date(value),
-    )
-
-    return new_months
-
-
-def scrape_capital_market_incremental(page, url, available_years, latest_complete_month):
-    main_rows = []
-    raw_rows = []
-
-    for year in available_years:
-        print(f"\nChecking Capital Market year: {year}")
-
-        opened = open_segment_page(page, url)
-
-        if not opened:
-            print(f"Could not open Capital Market page for year: {year}")
-            continue
-
-        clicked = click_text(page, year)
-
-        if not clicked:
-            print(f"Could not click Capital Market year: {year}")
-            continue
-
-        all_tables = extract_tables(page)
-        summary_table = find_month_summary_table(all_tables)
-
-        year_main_rows, year_raw_rows = normalize_capital_market_year(
-            summary_table=summary_table,
-            clicked_year=year,
-        )
-
-        new_month_labels = set()
-
-        for row in year_main_rows:
-            month_date = month_label_to_date(row["month_label"])
-
-            if pd.isna(month_date):
-                continue
-
-            if month_date > latest_complete_month:
-                main_rows.append(row)
-                new_month_labels.add(row["month_label"])
-
-        for row in year_raw_rows:
-            if row["month_label"] in new_month_labels:
-                raw_rows.append(row)
-
-    return main_rows, raw_rows
-
-
-def scrape_derivative_incremental(
-    page,
-    source_name,
-    segment_name,
-    url,
-    available_years,
-    latest_complete_month,
-):
-    main_rows = []
-    raw_rows = []
-
-    for year in available_years:
-        print(f"\nChecking {segment_name} year: {year}")
-
-        opened = open_segment_page(page, url)
-
-        if not opened:
-            print(f"Could not open {segment_name} page for year: {year}")
-            continue
-
-        clicked = click_text(page, year)
-
-        if not clicked:
-            print(f"Could not click {segment_name} year: {year}")
-            continue
-
-        all_tables = extract_tables(page)
-        summary_table = find_month_summary_table(all_tables)
-
-        new_months = find_new_months_from_summary(
-            summary_table=summary_table,
-            latest_complete_month=latest_complete_month,
-        )
-
-        print(f"New candidate months found: {new_months}")
-
-        for month_label in new_months:
-            print(f"  Processing {segment_name}: {month_label}")
-
-            clicked_month = click_month_from_summary_table(page, month_label)
-
-            if not clicked_month:
-                print(f"  Could not click month: {month_label}")
-                opened = open_segment_page(page, url)
-                if opened:
-                    click_text(page, year)
-                continue
-
-            all_month_tables = extract_tables(page)
-            best_table_index, daily_rows = extract_daily_rows_from_tables(all_month_tables)
-
-            if not daily_rows:
-                print(f"  No daily rows found: {segment_name} | {month_label}")
-                opened = open_segment_page(page, url)
-                if opened:
-                    click_text(page, year)
-                continue
-
-            daily_df = get_daily_dataframe(
-                source_name=source_name,
-                segment=segment_name,
-                year=year,
-                month_label=month_label,
-                daily_rows=daily_rows,
-            )
-
-            if daily_df.empty:
-                print(f"  Daily dataframe empty: {segment_name} | {month_label}")
-                opened = open_segment_page(page, url)
-                if opened:
-                    click_text(page, year)
-                continue
-
-            print(
-                f"  Daily rows: {len(daily_df)} | "
-                f"active days: {daily_df['date'].nunique()} | "
-                f"table index: {best_table_index}"
-            )
-
-            if source_name == "equity_derivatives":
-                month_main_rows = aggregate_equity_derivatives(month_label, daily_df)
-                month_raw_rows = build_equity_raw_rows(month_label, year, daily_df)
-
-            elif source_name == "currency_derivatives":
-                month_main_rows = aggregate_currency_derivatives(month_label, daily_df)
-                month_raw_rows = build_currency_raw_rows(month_label, year, daily_df)
-
-            elif source_name == "interest_rate_derivatives":
-                month_main_rows = aggregate_interest_rate_derivatives(month_label, daily_df)
-                month_raw_rows = build_ird_raw_rows(month_label, year, daily_df)
-
-            else:
-                month_main_rows = []
-                month_raw_rows = []
-
-            main_rows.extend(month_main_rows)
-            raw_rows.extend(month_raw_rows)
-
-            opened = open_segment_page(page, url)
-
-            if opened:
-                click_text(page, year)
-
-    return main_rows, raw_rows
-
-
-def get_complete_new_month_labels(existing_main_df, candidate_main_rows, latest_complete_month):
-    if not candidate_main_rows:
-        return set()
-
-    candidate_df = pd.DataFrame(candidate_main_rows)
-
-    candidate_df["segment"] = candidate_df["segment"].astype(str).str.strip()
-    candidate_df["instrument"] = candidate_df["instrument"].replace("", "NA").astype(str).str.strip()
-    candidate_df["month_label"] = candidate_df["month_label"].astype(str).str.strip()
-
-    combined_df = pd.concat(
-        [
-            existing_main_df[
-                [
-                    "segment",
-                    "instrument",
-                    "month_label",
-                ]
-            ],
-            candidate_df[
-                [
-                    "segment",
-                    "instrument",
-                    "month_label",
-                ]
-            ],
-        ],
-        ignore_index=True,
-    )
-
-    complete_month_labels = set()
-
-    grouped = (
-        combined_df.groupby("month_label")
-        .apply(
-            lambda x: set(
-                zip(
-                    x["segment"].astype(str),
-                    x["instrument"].astype(str),
-                )
-            )
-        )
-        .reset_index(name="groups")
-    )
-
-    for _, row in grouped.iterrows():
-        month_label = row["month_label"]
-        month_date = month_label_to_date(month_label)
-
-        if pd.isna(month_date):
-            continue
-
-        if month_date <= latest_complete_month:
-            continue
-
-        if EXPECTED_GROUPS.issubset(row["groups"]):
-            complete_month_labels.add(month_label)
-
-    return complete_month_labels
-
-
-def filter_new_rows_to_complete_months(candidate_main_rows, candidate_raw_rows, complete_month_labels):
-    if not complete_month_labels:
-        return [], []
-
-    filtered_main_rows = [
-        row
-        for row in candidate_main_rows
-        if row.get("month_label") in complete_month_labels
-    ]
-
-    filtered_raw_rows = [
-        row
-        for row in candidate_raw_rows
-        if row.get("month_label") in complete_month_labels
-    ]
-
-    return filtered_main_rows, filtered_raw_rows
-
-
-def append_unique_main_rows(main_df, new_rows):
-    if not new_rows:
-        return main_df.copy()
-
-    new_df = pd.DataFrame(new_rows)
-
-    combined = pd.concat([main_df, new_df], ignore_index=True)
-
-    combined["instrument"] = combined["instrument"].replace("", "NA").astype(str)
-
-    combined = combined.drop_duplicates(
+    df = df.drop_duplicates(
         subset=["segment", "instrument", "month_label"],
         keep="last",
     )
 
-    return combined
+    df = df.sort_values(["segment", "instrument", "month_date"])
+    df = recompute_mom_changes(df)
+
+    return df
 
 
-def append_unique_raw_rows(raw_df, new_rows):
-    if not new_rows:
-        return raw_df.copy()
+def normalize_raw_df(df):
+    if df.empty:
+        return pd.DataFrame()
 
-    new_df = pd.DataFrame(new_rows)
+    df = df.copy()
 
-    combined = pd.concat([raw_df, new_df], ignore_index=True)
+    for column in RAW_REQUIRED_COLUMNS:
+        if column not in df.columns:
+            df[column] = pd.NA
 
-    if "instrument" in combined.columns:
-        combined["instrument"] = combined["instrument"].replace("", "NA").astype(str)
+    df["segment"] = df["segment"].astype(str).str.strip()
+    df["instrument"] = df["instrument"].apply(normalize_instrument)
+    df["month_label"] = df["month_label"].astype(str).str.strip()
 
-    required_subset = [
-        "source_name",
-        "segment",
-        "instrument",
-        "clicked_year",
-        "month_label",
-        "date",
-        "source_level",
+    if "month_date" in df.columns:
+        df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
+
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+
+    return df
+
+
+def recompute_mom_changes(df):
+    if df.empty:
+        return df
+
+    df = df.copy()
+    df = df.sort_values(["segment", "instrument", "month_date"])
+
+    df["mom_turnover_change"] = (
+        df.groupby(["segment", "instrument"])["turnover"].pct_change()
+    )
+
+    df["mom_volume_change"] = (
+        df.groupby(["segment", "instrument"])["volume"].pct_change()
+    )
+
+    return df
+
+
+def create_backup_if_needed(main_df, raw_df):
+    import os
+
+    if os.getenv("GITHUB_ACTIONS", "false").lower() == "true":
+        print("Running in GitHub Actions. Skipping backup file creation.")
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if not main_df.empty:
+        backup_main = BACKUP_DIR / f"backup_clean_nse_business_growth_from_nse_{timestamp}.csv"
+        main_df.to_csv(backup_main, index=False)
+        print(f"Main backup saved: {backup_main}")
+
+    if not raw_df.empty:
+        backup_raw = BACKUP_DIR / f"backup_final_raw_nse_daily_trading_days_{timestamp}.csv"
+        raw_df.to_csv(backup_raw, index=False)
+        print(f"Raw backup saved : {backup_raw}")
+
+
+def get_latest_complete_month(main_df):
+    if main_df.empty:
+        return None
+
+    summary = (
+        main_df.groupby("month_date")[["segment", "instrument"]]
+        .apply(lambda x: set(zip(x["segment"], x["instrument"])))
+        .reset_index(name="groups")
+    )
+
+    complete_months = summary[
+        summary["groups"].apply(lambda groups: EXPECTED_GROUPS.issubset(groups))
+    ].copy()
+
+    if complete_months.empty:
+        return None
+
+    return complete_months["month_date"].max()
+
+
+def get_current_month_start():
+    now = datetime.now()
+    return pd.Timestamp(year=now.year, month=now.month, day=1)
+
+
+def get_candidate_financial_years(latest_complete_month):
+    current_year = datetime.now().year
+
+    if latest_complete_month is None or pd.isna(latest_complete_month):
+        base_year = current_year
+    else:
+        latest_complete_month = pd.to_datetime(latest_complete_month)
+
+        if latest_complete_month.month >= 4:
+            base_year = latest_complete_month.year
+        else:
+            base_year = latest_complete_month.year - 1
+
+    candidate_start_years = sorted(
+        {
+            base_year,
+            base_year + 1,
+            current_year - 1,
+            current_year,
+            current_year + 1,
+        }
+    )
+
+    candidate_start_years = [
+        year
+        for year in candidate_start_years
+        if 1999 <= year <= current_year + 1
     ]
 
-    available_subset = [
-        column
-        for column in required_subset
-        if column in combined.columns
-    ]
+    return [f"{year}-{year + 1}" for year in candidate_start_years]
 
-    if available_subset:
-        combined = combined.drop_duplicates(
-            subset=available_subset,
-            keep="last",
+
+def prepare_temp_scrape_files(main_df, raw_df):
+    main_df.to_csv(TEMP_MAIN_PATH, index=False)
+
+    if raw_df.empty:
+        raw_df.to_csv(TEMP_RAW_PATH, index=False)
+    else:
+        raw_df.to_csv(TEMP_RAW_PATH, index=False)
+
+    latest_complete_month = get_latest_complete_month(main_df)
+    current_month_start = get_current_month_start()
+
+    scraper.MAIN_OUTPUT_FILE = TEMP_MAIN_PATH
+    scraper.RAW_OUTPUT_FILE = TEMP_RAW_PATH
+    scraper.MAX_YEARS_PER_SEGMENT = 3
+    scraper.SCRAPE_ONLY_AFTER_MONTH_DATE = latest_complete_month
+    scraper.SCRAPE_ONLY_BEFORE_MONTH_DATE = current_month_start
+
+    if latest_complete_month is not None:
+        print(
+            "Scraper lower cutoff enabled. Only scraping months after: "
+            f"{latest_complete_month.strftime('%b-%Y')}"
         )
 
-    return combined
+    print(
+        "Scraper upper cutoff enabled. Skipping running/current month and later: "
+        f"{current_month_start.strftime('%b-%Y')}"
+    )
 
 
-def filter_raw_to_main(raw_df, main_df):
-    if raw_df.empty:
-        return raw_df.copy()
+def run_candidate_scrape(main_df, raw_df):
+    prepare_temp_scrape_files(main_df, raw_df)
 
-    main_keys = set(
+    print("Running NSE candidate scrape using optimized recent-year mode...")
+    scraped_main_df, scraped_raw_df = scraper.scrape_all_segments()
+
+    if scraped_main_df is None and scraped_raw_df is None:
+        raise IncrementalUpdateError(
+            "NSE scraping failed before candidate rows could be produced. "
+            "Failing workflow intentionally instead of silently reloading old data."
+        )
+
+    if scraped_main_df is None:
+        scraped_main_df = read_csv_safely(TEMP_MAIN_PATH)
+
+    if scraped_raw_df is None:
+        scraped_raw_df = read_csv_safely(TEMP_RAW_PATH)
+
+    scraped_main_df = normalize_main_df(scraped_main_df)
+    scraped_raw_df = normalize_raw_df(scraped_raw_df)
+
+    return scraped_main_df, scraped_raw_df
+
+
+def get_new_candidate_main_rows(scraped_main_df, latest_complete_month):
+    if scraped_main_df.empty:
+        return pd.DataFrame(columns=MAIN_COLUMNS)
+
+    candidate_df = scraped_main_df.copy()
+
+    if latest_complete_month is not None and not pd.isna(latest_complete_month):
+        candidate_df = candidate_df[
+            candidate_df["month_date"] > pd.to_datetime(latest_complete_month)
+        ].copy()
+
+    current_month_start = get_current_month_start()
+
+    candidate_df = candidate_df[
+        candidate_df["month_date"] < current_month_start
+    ].copy()
+
+    candidate_df = candidate_df.sort_values(["month_date", "segment", "instrument"])
+
+    return candidate_df
+
+
+def get_complete_new_months(candidate_main_df):
+    if candidate_main_df.empty:
+        return []
+
+    months = []
+
+    for month_date, group_df in candidate_main_df.groupby("month_date"):
+        available_groups = set(zip(group_df["segment"], group_df["instrument"]))
+
+        if EXPECTED_GROUPS.issubset(available_groups):
+            months.append(pd.to_datetime(month_date))
+        else:
+            missing_groups = EXPECTED_GROUPS - available_groups
+            month_text = pd.to_datetime(month_date).strftime("%b-%Y")
+            print(f"Incomplete month skipped: {month_text}")
+            print(f"Missing groups: {sorted(missing_groups)}")
+
+    return sorted(months)
+
+
+def filter_main_to_complete_months(candidate_main_df, complete_months):
+    if candidate_main_df.empty or not complete_months:
+        return pd.DataFrame(columns=MAIN_COLUMNS)
+
+    complete_month_set = set(pd.to_datetime(complete_months))
+
+    complete_df = candidate_main_df[
+        candidate_main_df["month_date"].isin(complete_month_set)
+    ].copy()
+
+    complete_df = complete_df[
+        complete_df.apply(
+            lambda row: (row["segment"], row["instrument"]) in EXPECTED_GROUPS,
+            axis=1,
+        )
+    ].copy()
+
+    complete_df = complete_df.drop_duplicates(
+        subset=["segment", "instrument", "month_label"],
+        keep="last",
+    )
+
+    return complete_df[MAIN_COLUMNS].copy()
+
+
+def filter_raw_to_complete_main_rows(scraped_raw_df, complete_main_df):
+    if scraped_raw_df.empty or complete_main_df.empty:
+        return pd.DataFrame(columns=scraped_raw_df.columns)
+
+    allowed_keys = set(
         zip(
-            main_df["segment"].astype(str),
-            main_df["instrument"].replace("", "NA").astype(str),
-            main_df["month_label"].astype(str),
+            complete_main_df["segment"].astype(str),
+            complete_main_df["instrument"].astype(str),
+            complete_main_df["month_label"].astype(str),
         )
     )
 
-    raw_df = raw_df.copy()
-
-    raw_df["segment"] = raw_df["segment"].astype(str)
-    raw_df["instrument"] = raw_df["instrument"].replace("", "NA").astype(str)
-    raw_df["month_label"] = raw_df["month_label"].astype(str)
+    raw_df = scraped_raw_df.copy()
 
     raw_df = raw_df[
         raw_df.apply(
             lambda row: (
-                row["segment"],
-                row["instrument"],
-                row["month_label"],
-            )
-            in main_keys,
+                str(row["segment"]),
+                str(row["instrument"]),
+                str(row["month_label"]),
+            ) in allowed_keys,
             axis=1,
         )
     ].copy()
@@ -512,251 +394,267 @@ def filter_raw_to_main(raw_df, main_df):
     return raw_df
 
 
+def merge_main_data(current_main_df, complete_new_main_df):
+    if complete_new_main_df.empty:
+        return current_main_df.copy()
+
+    merged_df = pd.concat(
+        [current_main_df, complete_new_main_df],
+        ignore_index=True,
+    )
+
+    merged_df = normalize_main_df(merged_df)
+
+    return merged_df
+
+
+def merge_raw_data(current_raw_df, new_raw_df):
+    if new_raw_df.empty:
+        return current_raw_df.copy()
+
+    merged_df = pd.concat(
+        [current_raw_df, new_raw_df],
+        ignore_index=True,
+    )
+
+    merged_df = normalize_raw_df(merged_df)
+
+    subset_columns = [
+        column for column in ["segment", "instrument", "month_label", "date"]
+        if column in merged_df.columns
+    ]
+
+    if subset_columns:
+        merged_df = merged_df.drop_duplicates(subset=subset_columns, keep="last")
+
+    return merged_df
+
+
+def clean_raw_against_main(raw_df, main_df):
+    if raw_df.empty or main_df.empty:
+        return raw_df.copy()
+
+    allowed_keys = set(
+        zip(
+            main_df["segment"].astype(str),
+            main_df["instrument"].astype(str),
+            main_df["month_label"].astype(str),
+        )
+    )
+
+    cleaned_raw_df = raw_df[
+        raw_df.apply(
+            lambda row: (
+                str(row["segment"]),
+                str(row["instrument"]),
+                str(row["month_label"]),
+            ) in allowed_keys,
+            axis=1,
+        )
+    ].copy()
+
+    return cleaned_raw_df
+
+
 def save_outputs(main_df, raw_df):
-    main_df = add_dashboard_fields(main_df)
-
-    main_df = main_df.drop_duplicates(
-        subset=["segment", "instrument", "month_label"],
-        keep="last",
-    )
-
-    main_df = remove_incomplete_latest_month(main_df)
-
-    main_df = main_df.sort_values(
-        ["segment", "instrument", "month_date"]
-    )
-
+    main_df = main_df.copy()
     raw_df = raw_df.copy()
 
+    main_for_csv = main_df.copy()
+    main_for_csv["month_date"] = (
+        pd.to_datetime(main_for_csv["month_date"]).dt.strftime("%Y-%m-%d")
+    )
+
+    main_for_csv.to_csv(MAIN_DATASET_PATH, index=False)
+
     if not raw_df.empty:
-        raw_df = filter_raw_to_main(raw_df, main_df)
+        raw_for_csv = raw_df.copy()
 
-        raw_df = raw_df.drop_duplicates(
-            subset=[
-                "source_name",
-                "segment",
-                "instrument",
-                "clicked_year",
-                "month_label",
-                "date",
-                "source_level",
-            ],
-            keep="last",
-        )
+        if "month_date" in raw_for_csv.columns:
+            raw_for_csv["month_date"] = (
+                pd.to_datetime(raw_for_csv["month_date"], errors="coerce")
+                .dt.strftime("%Y-%m-%d")
+            )
 
-    MAIN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    RAW_FILE.parent.mkdir(parents=True, exist_ok=True)
+        if "date" in raw_for_csv.columns:
+            raw_for_csv["date"] = (
+                pd.to_datetime(raw_for_csv["date"], errors="coerce")
+                .dt.strftime("%Y-%m-%d")
+            )
 
-    main_df.to_csv(
-        MAIN_FILE,
-        index=False,
-        encoding="utf-8-sig",
-    )
-
-    raw_df.to_csv(
-        RAW_FILE,
-        index=False,
-        encoding="utf-8-sig",
-    )
-
-    return main_df, raw_df
+        raw_for_csv.to_csv(RAW_EVIDENCE_PATH, index=False)
+    else:
+        raw_df.to_csv(RAW_EVIDENCE_PATH, index=False)
 
 
 def reload_sqlite(main_df):
     db_df = main_df.copy()
+    db_df["month_date"] = pd.to_datetime(db_df["month_date"]).dt.strftime("%Y-%m-%d")
 
-    db_df["month_date"] = pd.to_datetime(db_df["month_date"], errors="coerce")
-    db_df = db_df.dropna(subset=["month_date"]).copy()
-    db_df["month_date"] = db_df["month_date"].dt.strftime("%Y-%m-%d")
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(DB_PATH) as conn:
+        db_df.to_sql(DB_TABLE_NAME, conn, if_exists="replace", index=False)
 
-    conn = sqlite3.connect(DB_FILE)
+    print("SQLite reloaded successfully.")
 
-    db_df.to_sql(
-        TABLE_NAME,
-        conn,
-        if_exists="replace",
-        index=False,
+    summary = (
+        main_df.groupby(["segment", "instrument"])
+        .agg(
+            rows=("month_label", "count"),
+            start_month=("month_date", "min"),
+            end_month=("month_date", "max"),
+        )
+        .reset_index()
     )
 
-    check_df = pd.read_sql_query(
-        f"""
-        SELECT
-            segment,
-            instrument,
-            COUNT(*) AS rows,
-            MIN(month_date) AS start_month,
-            MAX(month_date) AS end_month
-        FROM {TABLE_NAME}
-        GROUP BY segment, instrument
-        ORDER BY segment, instrument
-        """,
-        conn,
-    )
+    print(summary.to_string(index=False))
 
-    conn.close()
 
-    print("\nSQLite reloaded successfully.")
-    print(check_df.to_string(index=False))
+def print_group_summary(label, df):
+    print(f"\n{label} group summary:")
+
+    if df.empty:
+        print("Empty dataframe")
+        return
+
+    print(df.groupby(["segment", "instrument"]).size())
+
+
+def cleanup_temp_files():
+    for path in [TEMP_MAIN_PATH, TEMP_RAW_PATH]:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception as error:
+            print(f"Could not delete temp file {path}: {error}")
 
 
 def main():
     print("Starting NSE incremental monthly updater...")
-    print()
 
-    main_df = read_main_data()
-    raw_df = read_raw_data()
+    ensure_directories()
 
-    latest_complete_month = get_latest_complete_month(main_df)
+    if not MAIN_DATASET_PATH.exists():
+        raise FileNotFoundError(f"Main dataset not found: {MAIN_DATASET_PATH}")
 
-    print(f"Latest complete month in current data: {latest_complete_month.strftime('%b-%Y')}")
+    if not RAW_EVIDENCE_PATH.exists():
+        raise FileNotFoundError(f"Raw evidence dataset not found: {RAW_EVIDENCE_PATH}")
 
-    candidate_years = get_candidate_years_from_latest(latest_complete_month)
+    current_main_df = normalize_main_df(read_csv_safely(MAIN_DATASET_PATH))
+    current_raw_df = normalize_raw_df(read_csv_safely(RAW_EVIDENCE_PATH))
 
-    print(f"Candidate financial years to check: {sorted(candidate_years)}")
+    main_rows_before = len(current_main_df)
+    raw_rows_before = len(current_raw_df)
 
-    backup_current_files()
+    latest_complete_month = get_latest_complete_month(current_main_df)
 
-    all_candidate_main_rows = []
-    all_candidate_raw_rows = []
+    if latest_complete_month is None:
+        print("Latest complete month in current data: Not found")
+    else:
+        print(f"Latest complete month in current data: {latest_complete_month.strftime('%b-%Y')}")
 
-    with sync_playwright() as p:
-        headless = os.getenv("PLAYWRIGHT_HEADLESS", "false").lower() == "true"
+    current_month_start = get_current_month_start()
+    print(f"Current running month skipped from scraping: {current_month_start.strftime('%b-%Y')}")
 
-        browser = p.chromium.launch(
-            headless=headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--start-maximized",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
+    candidate_years = get_candidate_financial_years(latest_complete_month)
+    print(f"Candidate financial years to check: {candidate_years}")
 
-        context = browser.new_context(
-            viewport={"width": 1600, "height": 1000},
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/120.0.0.0 Safari/537.36"
-            ),
-            locale="en-US",
-            ignore_https_errors=True,
-        )
+    create_backup_if_needed(current_main_df, current_raw_df)
 
-        page = context.new_page()
-
-        for source_name, config in NSE_SEGMENT_URLS.items():
-            segment_name = config["segment"]
-            url = config["url"]
-
-            print("\n" + "=" * 100)
-            print(f"Checking segment: {segment_name}")
-            print("=" * 100)
-
-            opened = open_segment_page(page, url)
-
-            if not opened:
-                print(f"Could not open segment page: {segment_name}")
-                continue
-
-            website_years = get_available_financial_years(page)
-
-            available_years = [
-                year
-                for year in website_years
-                if year in candidate_years
-            ]
-
-            if not available_years:
-                print(f"No candidate years found on page for {segment_name}")
-                continue
-
-            print(f"Available candidate years: {available_years}")
-
-            if source_name == "capital_market":
-                segment_main_rows, segment_raw_rows = scrape_capital_market_incremental(
-                    page=page,
-                    url=url,
-                    available_years=available_years,
-                    latest_complete_month=latest_complete_month,
-                )
-
-            else:
-                segment_main_rows, segment_raw_rows = scrape_derivative_incremental(
-                    page=page,
-                    source_name=source_name,
-                    segment_name=segment_name,
-                    url=url,
-                    available_years=available_years,
-                    latest_complete_month=latest_complete_month,
-                )
-
-            all_candidate_main_rows.extend(segment_main_rows)
-            all_candidate_raw_rows.extend(segment_raw_rows)
-
-        browser.close()
-
-    complete_new_month_labels = get_complete_new_month_labels(
-        existing_main_df=main_df,
-        candidate_main_rows=all_candidate_main_rows,
-        latest_complete_month=latest_complete_month,
+    scraped_main_df, scraped_raw_df = run_candidate_scrape(
+        current_main_df,
+        current_raw_df,
     )
 
-    print()
-    print(f"Candidate scraped main rows: {len(all_candidate_main_rows)}")
-    print(f"Candidate scraped raw rows : {len(all_candidate_raw_rows)}")
-    print(f"Complete new months found : {sorted(complete_new_month_labels)}")
-
-    new_main_rows, new_raw_rows = filter_new_rows_to_complete_months(
-        candidate_main_rows=all_candidate_main_rows,
-        candidate_raw_rows=all_candidate_raw_rows,
-        complete_month_labels=complete_new_month_labels,
+    candidate_main_df = get_new_candidate_main_rows(
+        scraped_main_df,
+        latest_complete_month,
     )
 
-    if not complete_new_month_labels:
-        print()
-        print("No complete new month found.")
+    print(f"Candidate scraped main rows: {len(candidate_main_df)}")
+
+    if candidate_main_df.empty:
+        candidate_raw_df = pd.DataFrame(columns=scraped_raw_df.columns)
+    else:
+        candidate_keys = set(
+            zip(
+                candidate_main_df["segment"].astype(str),
+                candidate_main_df["instrument"].astype(str),
+                candidate_main_df["month_label"].astype(str),
+            )
+        )
+
+        candidate_raw_df = scraped_raw_df[
+            scraped_raw_df.apply(
+                lambda row: (
+                    str(row["segment"]),
+                    str(row["instrument"]),
+                    str(row["month_label"]),
+                ) in candidate_keys,
+                axis=1,
+            )
+        ].copy()
+
+    print(f"Candidate scraped raw rows : {len(candidate_raw_df)}")
+
+    complete_new_months = get_complete_new_months(candidate_main_df)
+    complete_month_labels = [
+        month.strftime("%b-%Y")
+        for month in complete_new_months
+    ]
+
+    print(f"Complete new months found : {complete_month_labels}")
+
+    if not complete_new_months:
+        print("\nNo complete new month found.")
         print("Nothing will be appended to main or raw.")
         print("Cleaning raw against current main keys and reloading SQLite only.")
 
-    before_main_rows = len(main_df)
-    before_raw_rows = len(raw_df)
+        final_main_df = current_main_df.copy()
+        final_raw_df = clean_raw_against_main(current_raw_df, final_main_df)
 
-    updated_main_df = append_unique_main_rows(main_df, new_main_rows)
-    updated_raw_df = append_unique_raw_rows(raw_df, new_raw_rows)
+    else:
+        complete_new_main_df = filter_main_to_complete_months(
+            candidate_main_df,
+            complete_new_months,
+        )
 
-    final_main_df, final_raw_df = save_outputs(updated_main_df, updated_raw_df)
+        complete_new_raw_df = filter_raw_to_complete_main_rows(
+            candidate_raw_df,
+            complete_new_main_df,
+        )
 
+        print(f"Complete new main rows to append: {len(complete_new_main_df)}")
+        print(f"Complete new raw rows to append : {len(complete_new_raw_df)}")
+
+        final_main_df = merge_main_data(current_main_df, complete_new_main_df)
+        final_raw_df = merge_raw_data(current_raw_df, complete_new_raw_df)
+        final_raw_df = clean_raw_against_main(final_raw_df, final_main_df)
+
+    save_outputs(final_main_df, final_raw_df)
     reload_sqlite(final_main_df)
 
+    main_rows_after = len(final_main_df)
+    raw_rows_after = len(final_raw_df)
+
     print("\nIncremental update completed.")
-    print(f"Main rows before: {before_main_rows}")
-    print(f"Main rows after : {len(final_main_df)}")
-    print(f"Main rows added : {len(final_main_df) - before_main_rows}")
-    print()
-    print(f"Raw rows before : {before_raw_rows}")
-    print(f"Raw rows after  : {len(final_raw_df)}")
-    print(f"Raw rows added  : {len(final_raw_df) - before_raw_rows}")
-    print()
-    print("Final main group summary:")
-    print(
-        final_main_df.groupby(["segment", "instrument"], dropna=False)
-        .size()
-        .to_string()
-    )
-    print()
-    print("Final raw group summary:")
-    if not final_raw_df.empty:
-        print(
-            final_raw_df.groupby(["segment", "instrument"], dropna=False)
-            .size()
-            .to_string()
-        )
-    else:
-        print("Raw dataframe is empty.")
+    print(f"Main rows before: {main_rows_before}")
+    print(f"Main rows after : {main_rows_after}")
+    print(f"Main rows added : {main_rows_after - main_rows_before}")
+
+    print(f"\nRaw rows before : {raw_rows_before}")
+    print(f"Raw rows after  : {raw_rows_after}")
+    print(f"Raw rows added  : {raw_rows_after - raw_rows_before}")
+
+    print_group_summary("Final main", final_main_df)
+    print_group_summary("Final raw", final_raw_df)
+
+    cleanup_temp_files()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        cleanup_temp_files()
