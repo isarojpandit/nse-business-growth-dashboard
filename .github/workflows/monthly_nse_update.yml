@@ -1,157 +1,241 @@
-name: Monthly NSE Data Update
+name: Monthly NSE Data Validation
 
 on:
-  schedule:
-    # Runs on 5th day of every month at 09:00 AM IST
-    # GitHub cron uses UTC, so 03:30 UTC = 09:00 IST
-    - cron: "30 3 5 * *"
-
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  update-nse-data:
+  validate-nse-data:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.13"
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas openpyxl
 
-      - name: Install Playwright Chromium
-        run: |
-          python -m playwright install chromium --with-deps
-
-      - name: Run optimized incremental NSE data update
-        env:
-          GITHUB_ACTIONS: "true"
-          PLAYWRIGHT_HEADLESS: "true"
-        run: |
-          xvfb-run -a python scripts/update_nse_monthly_incremental.py
-
-      - name: Validate updated dataset
+      - name: Validate required NSE data files
         run: |
           python - <<'PY'
-          import sqlite3
-          import pandas as pd
           from pathlib import Path
 
-          main_file = Path("data/processed/clean_nse_business_growth_from_nse.csv")
-          raw_file = Path("data/exports/final_raw_nse_daily_trading_days.csv")
-          db_file = Path("data/nse_business_growth.db")
+          required_files = [
+              Path("data/processed/clean_nse_business_growth_from_nse.csv"),
+              Path("data/exports/final_raw_nse_daily_trading_days.csv"),
+              Path("data/nse_business_growth.db"),
+          ]
 
-          if not main_file.exists():
-              raise FileNotFoundError(main_file)
+          missing = [str(path) for path in required_files if not path.exists()]
 
-          if not raw_file.exists():
-              raise FileNotFoundError(raw_file)
+          if missing:
+              raise SystemExit(f"Missing required files: {missing}")
 
-          if not db_file.exists():
-              raise FileNotFoundError(db_file)
+          print("All required data files exist.")
+          PY
 
-          main = pd.read_csv(main_file, keep_default_na=False)
-          raw = pd.read_csv(raw_file, keep_default_na=False)
+      - name: Validate NSE main dataset
+        run: |
+          python - <<'PY'
+          import pandas as pd
 
-          main["instrument"] = main["instrument"].replace("", "NA")
-          raw["instrument"] = raw["instrument"].replace("", "NA")
+          main_path = "data/processed/clean_nse_business_growth_from_nse.csv"
 
-          print("MAIN ROWS:", len(main))
-          print(main.groupby(["segment", "instrument"], dropna=False).size())
+          df = pd.read_csv(main_path, keep_default_na=False)
 
+          required_columns = [
+              "segment",
+              "instrument",
+              "year",
+              "month_label",
+              "month_date",
+              "calendar_quarter",
+              "financial_year",
+              "financial_quarter",
+              "turnover",
+              "volume",
+              "mom_turnover_change",
+              "mom_volume_change",
+          ]
+
+          missing_columns = [col for col in required_columns if col not in df.columns]
+
+          if missing_columns:
+              raise SystemExit(f"Main dataset missing columns: {missing_columns}")
+
+          df["month_date"] = pd.to_datetime(df["month_date"], errors="coerce")
+
+          if df["month_date"].isna().any():
+              bad_rows = df[df["month_date"].isna()].head(10)
+              raise SystemExit(f"Invalid month_date values found:\n{bad_rows}")
+
+          duplicate_count = df.duplicated(
+              subset=["segment", "instrument", "month_label"]
+          ).sum()
+
+          if duplicate_count:
+              raise SystemExit(f"Duplicate main keys found: {duplicate_count}")
+
+          expected_groups = {
+              ("Capital Market", "NA"),
+              ("Currency Derivatives", "Futures"),
+              ("Currency Derivatives", "Options"),
+              ("Equity Derivatives", "Futures"),
+              ("Equity Derivatives", "Options"),
+              ("Interest Rate Derivatives", "NA"),
+          }
+
+          actual_groups = set(zip(df["segment"], df["instrument"]))
+
+          missing_groups = expected_groups - actual_groups
+
+          if missing_groups:
+              raise SystemExit(f"Missing segment/instrument groups: {sorted(missing_groups)}")
+
+          latest_month = df["month_date"].max()
+
+          latest_df = df[df["month_date"] == latest_month]
+
+          latest_groups = set(zip(latest_df["segment"], latest_df["instrument"]))
+
+          missing_latest_groups = expected_groups - latest_groups
+
+          if missing_latest_groups:
+              raise SystemExit(
+                  "Latest month is incomplete. "
+                  f"Latest month: {latest_month.strftime('%b-%Y')}, "
+                  f"missing groups: {sorted(missing_latest_groups)}"
+              )
+
+          print("Main dataset validation passed.")
+          print(f"Rows: {len(df)}")
+          print(f"Latest complete month: {latest_month.strftime('%b-%Y')}")
           print()
-          print("RAW ROWS:", len(raw))
-          print(raw.groupby(["segment", "instrument"], dropna=False).size())
+          print(
+              df.groupby(["segment", "instrument"])["month_date"]
+              .agg(["count", "min", "max"])
+              .reset_index()
+              .to_string(index=False)
+          )
+          PY
+
+      - name: Validate NSE raw evidence dataset
+        run: |
+          python - <<'PY'
+          import pandas as pd
+
+          main_path = "data/processed/clean_nse_business_growth_from_nse.csv"
+          raw_path = "data/exports/final_raw_nse_daily_trading_days.csv"
+
+          main_df = pd.read_csv(main_path, keep_default_na=False)
+          raw_df = pd.read_csv(raw_path, keep_default_na=False)
+
+          required_raw_columns = [
+              "segment",
+              "instrument",
+              "month_label",
+          ]
+
+          missing_raw_columns = [
+              col for col in required_raw_columns
+              if col not in raw_df.columns
+          ]
+
+          if missing_raw_columns:
+              raise SystemExit(f"Raw dataset missing columns: {missing_raw_columns}")
 
           main_keys = set(
               zip(
-                  main["segment"].astype(str),
-                  main["instrument"].astype(str),
-                  main["month_label"].astype(str),
+                  main_df["segment"].astype(str),
+                  main_df["instrument"].astype(str),
+                  main_df["month_label"].astype(str),
               )
           )
 
           raw_keys = set(
               zip(
-                  raw["segment"].astype(str),
-                  raw["instrument"].astype(str),
-                  raw["month_label"].astype(str),
+                  raw_df["segment"].astype(str),
+                  raw_df["instrument"].astype(str),
+                  raw_df["month_label"].astype(str),
               )
           )
 
           extra_raw_keys = raw_keys - main_keys
 
           if extra_raw_keys:
-              raise ValueError(
-                  f"Raw has month keys not present in main: {sorted(extra_raw_keys)[:20]}"
+              sample = sorted(extra_raw_keys)[:20]
+              raise SystemExit(
+                  "Raw dataset contains keys not present in main dataset. "
+                  f"Sample: {sample}"
               )
 
-          conn = sqlite3.connect(db_file)
-
-          db_count = pd.read_sql_query(
-              "SELECT COUNT(*) AS rows FROM nse_business_growth",
-              conn,
+          print("Raw evidence validation passed.")
+          print(f"Raw rows: {len(raw_df)}")
+          print()
+          print(
+              raw_df.groupby(["segment", "instrument"])
+              .size()
+              .reset_index(name="rows")
+              .to_string(index=False)
           )
-
-          db_summary = pd.read_sql_query(
-              """
-              SELECT
-                  segment,
-                  instrument,
-                  COUNT(*) AS rows,
-                  MIN(month_date) AS start_month,
-                  MAX(month_date) AS end_month
-              FROM nse_business_growth
-              GROUP BY segment, instrument
-              ORDER BY segment, instrument
-              """,
-              conn,
-          )
-
-          conn.close()
-
-          print()
-          print("SQLITE ROWS:")
-          print(db_count.to_string(index=False))
-
-          print()
-          print(db_summary.to_string(index=False))
-
-          if int(db_count["rows"].iloc[0]) != len(main):
-              raise ValueError("SQLite row count does not match main CSV row count.")
-
-          print()
-          print("Validation successful.")
           PY
 
-      - name: Show updated files
+      - name: Validate SQLite database
         run: |
-          git status --short
+          python - <<'PY'
+          import sqlite3
+          import pandas as pd
+          from pathlib import Path
 
-      - name: Commit updated dataset, raw evidence, and database
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          db_path = Path("data/nse_business_growth.db")
+          main_path = Path("data/processed/clean_nse_business_growth_from_nse.csv")
 
-          git add data/processed/clean_nse_business_growth_from_nse.csv
-          git add data/exports/final_raw_nse_daily_trading_days.csv
-          git add data/nse_business_growth.db
+          main_df = pd.read_csv(main_path, keep_default_na=False)
 
-          if git diff --cached --quiet; then
-            echo "No complete new month found. No data changes to commit."
-          else
-            git commit -m "Monthly NSE incremental data update"
-            git push
-          fi
+          with sqlite3.connect(db_path) as conn:
+              db_df = pd.read_sql_query(
+                  "SELECT * FROM nse_business_growth",
+                  conn,
+              )
+
+          if len(db_df) != len(main_df):
+              raise SystemExit(
+                  f"SQLite row count mismatch. "
+                  f"CSV rows={len(main_df)}, DB rows={len(db_df)}"
+              )
+
+          db_required_columns = [
+              "segment",
+              "instrument",
+              "year",
+              "month_label",
+              "month_date",
+              "calendar_quarter",
+              "financial_year",
+              "financial_quarter",
+              "turnover",
+              "volume",
+              "mom_turnover_change",
+              "mom_volume_change",
+          ]
+
+          missing_db_columns = [
+              col for col in db_required_columns
+              if col not in db_df.columns
+          ]
+
+          if missing_db_columns:
+              raise SystemExit(f"SQLite table missing columns: {missing_db_columns}")
+
+          print("SQLite validation passed.")
+          print(f"SQLite rows: {len(db_df)}")
+          PY
